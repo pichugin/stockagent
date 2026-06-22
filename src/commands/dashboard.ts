@@ -1,25 +1,22 @@
 import type { Command } from 'commander';
 import { runMonitor } from '../monitor.js';
 
-interface StartOptions {
+interface DashboardOptions {
   force: boolean;
   once: boolean;
   limit: string;
-  /** commander stores `--no-notify` as `notify: false`. */
   notify: boolean;
-  dashboard: boolean;
 }
 
-export function registerStart(program: Command): void {
+export function registerDashboard(program: Command): void {
   program
-    .command('start')
-    .description('Poll the watchlist every minute, recompute signals, and notify on actionable ones.')
+    .command('dashboard')
+    .description('Live-updating CLI dashboard: poll, recompute signals, and redraw a table each cycle.')
     .option('--force', 'poll even when markets appear closed', false)
-    .option('--once', 'run a single poll cycle and exit', false)
+    .option('--once', 'render a single snapshot and exit', false)
     .option('--limit <n>', 'bars to fetch per symbol per cycle', '5')
-    .option('--no-notify', 'do not push native notifications (dashboard/queries still work)')
-    .option('--dashboard', 'also render the live CLI dashboard after each cycle', false)
-    .action(async (opts: StartOptions) => {
+    .option('--no-notify', 'do not push native notifications while the dashboard runs')
+    .action(async (opts: DashboardOptions) => {
       const limit = Number.parseInt(opts.limit, 10);
       if (!Number.isFinite(limit) || limit < 1) {
         throw new Error(`--limit must be a positive integer (got "${opts.limit}")`);
@@ -30,7 +27,7 @@ export function registerStart(program: Command): void {
         once: opts.once,
         limit,
         notify: opts.notify,
-        dashboard: opts.dashboard,
+        dashboard: true,
       });
     });
 }

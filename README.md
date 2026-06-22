@@ -1,4 +1,4 @@
-# StockAgent — Phases 1–4 (data, storage, portfolio, FX & signals)
+# StockAgent — Phases 1–5 (data, storage, portfolio, FX, signals, notifications & dashboard)
 
 A personal stock monitoring agent for macOS (CLI-first). Home currency is **CAD**.
 
@@ -18,13 +18,19 @@ A personal stock monitoring agent for macOS (CLI-first). Home currency is **CAD*
   over cached bars, combined into deduplicated, severity-rated **signal objects**
   with plain-language reasoning. No LLM, no notifications. See
   [Signals & alerts](#signals--alerts).
+- **Phase 5** adds **delivery** (not new analysis): native macOS **notifications**
+  for `actionable` signals only — fire-once, throttled, quiet-hours-aware, and
+  suppressed on startup so it never spams — plus a live-updating **CLI
+  dashboard**. See [Notifications](#notifications) and [Dashboard](#dashboard).
 
 **Signals describe what is currently true — never a prediction.** There is no
 forecast, no price target, no "expected move" anywhere in the engine; the
 multi-timeframe module reports *where price sits within past windows* as factual
-context only. Still **no LLM narration, ranking, or notifications** (later
-phases). "Current price" everywhere means the **latest cached close**, not a live
-tick.
+context only. Every notification body and dashboard cell carries the same
+framing — **"signal, not advice"**, "as of last cached close" — so nothing
+implies real-time data or a recommendation. Still **no LLM narration or ranking**
+(Phase 6). "Current price" everywhere means the **latest cached close**, not a
+live tick.
 
 ## Requirements
 
@@ -95,6 +101,8 @@ node dist/index.js start
 node dist/index.js start --once          # run a single cycle and exit
 node dist/index.js start --force         # poll even when markets are closed
 node dist/index.js start --limit 10      # fetch 10 bars/symbol/cycle
+node dist/index.js start --dashboard     # also render the live dashboard each cycle
+node dist/index.js start --no-notify     # mute native notifications (dashboard/queries still work)
 
 # Inspect stored data
 node dist/index.js bars AAPL --limit 5
@@ -212,9 +220,10 @@ node dist/index.js signals --history --limit 20     # recent fires (active + cle
 node dist/index.js signals --active --symbol TD.TO
 ```
 
-`start` recomputes signals after each per-minute poll cycle. Signal computation
-is **isolated**: a failure there is logged and never stops the poll loop (the
-same resilience contract as Phase 1).
+`start` recomputes signals after each per-minute poll cycle, then dispatches
+notifications for newly-`actionable` ones (Phase 5). Each concern is **isolated**:
+a failure in signal computation, notification, or rendering is logged and never
+stops the poll loop (the same resilience contract as Phase 1).
 
 ### What fires
 
@@ -244,7 +253,7 @@ is raised to `actionable`: any threshold hit, a **held** symbol that is oversold
 *and* near a window low, and a **held** symbol that is overbought *and*
 overweight. Dedup keeps **one active signal per (symbol, code)** while the
 condition stays continuously true — it only re-fires after clearing and
-re-triggering — so a future notification layer won't alert every minute.
+re-triggering — so the [notification layer](#notifications) won't alert every minute.
 
 ### Price alerts
 
@@ -283,6 +292,89 @@ signals:
 `preferences.cadBias` is **still** a parsed stub — it's a ranking input consumed
 by a later phase, not here.
 
+## Notifications
+
+Phase 5 pushes **native macOS notifications** (via `node-notifier`) for signals —
+but only after passing a deliberately strict discipline, because an alerting tool
+you can't trust to stay quiet is one you'll mute. The rules, all load-bearing:
+
+- **`actionable` only.** `info` / `notable` / `context` signals **never** push —
+  they're visible in the dashboard and `signals --active` only. This is the
+  firewall against notification fatigue.
+- **Fire-once.** A signal notifies exactly once, on the active-edge, tied to the
+  Phase-4 dedup state (a `notified_at` stamp on the signal row). It does **not**
+  re-notify every cycle while it stays true. Only after it clears and genuinely
+  re-fires does a new notification go out.
+- **Throttle / coalesce.** At most `maxPerWindow` pushes per `windowMinutes`. A
+  burst beyond that budget collapses into a **single summary** notification
+  (`"4 actionable signals — run stockagent signals --active"`) instead of N.
+- **Quiet hours.** While markets are closed (Phase-1 market-hours gate),
+  engine-derived actionable signals are held back (still visible in the
+  dashboard, never retroactively replayed when markets reopen). **User-set price
+  thresholds are hard alerts and push regardless** — you asked to be told when
+  that level is hit.
+- **Startup suppression.** On `start`, signals already active *before* this run
+  began are treated as already-known and never replayed as a backlog. Only
+  transitions that happen *during* the run notify.
+- **Resilient.** A push failure (e.g. permission not granted) is logged with a
+  one-time hint and **never** crashes the poll/signal loop.
+
+Every notification body ends with **"· signal, not advice."** — the same framing
+carried through every surface.
+
+Settings live in an optional `notifications:` block in `watchlist.yaml`
+(zod-validated, documented defaults):
+
+```yaml
+notifications:
+  enabled: true                  # master switch for native pushes
+  maxPerWindow: 5                # max notifications per window…
+  windowMinutes: 10              # …over this many minutes (else coalesce)
+  quietHoursOutsideMarket: true  # suppress non-threshold pushes when markets closed
+```
+
+`start --no-notify` mutes pushes for a single run (dashboard and queries still
+work); `notifications.enabled: false` disables them globally.
+
+### macOS notification permission (one-time setup)
+
+The first time a notification fires, macOS may ask to allow notifications from
+your terminal app (`node-notifier` ships `terminal-notifier`). If notifications
+never appear, enable them in **System Settings → Notifications**, find your
+terminal app (Terminal / iTerm) or **terminal-notifier**, and turn **Allow
+Notifications** on. StockAgent logs a one-time hint and keeps running if
+permission is denied.
+
+## Dashboard
+
+A live-updating terminal view over your watchlist + held symbols:
+
+```bash
+node dist/index.js dashboard              # poll + signal + redraw each cycle
+node dist/index.js dashboard --once       # render a single snapshot and exit
+node dist/index.js dashboard --no-notify  # dashboard only, no pushes
+node dist/index.js start --dashboard      # the monitoring loop *and* the dashboard
+```
+
+It renders (via `cli-table3` + `chalk` — chosen over a full TUI to stay close to
+the existing dependency-light table aesthetic): per symbol the latest **cached
+close** (with its as-of time — not a live tick), native currency, a held vs
+watch-only marker (`●` / `·`), and for held positions the CAD-normalized market
+value and unrealized P&L (green/red) **as of last close**. A signals column shows
+active-signal counts by severity with `actionable` highlighted (`★`). The header
+carries the FX rate + as-of date (with a `⚠ STALE` flag when applicable), market
+open/closed, and last poll time; the footer shows the total CAD portfolio value
+(with the Wealthsimple FX-spread footnote) and the most recent actionable signal
+summaries.
+
+**Honesty & resilience.** Everything price/P&L is labelled "as of last cached
+close" — never implied real-time. Mixed currencies show native per row, CAD for
+totals. The refresh cadence follows the poll cycle (it doesn't redraw faster than
+the data changes). In a **non-TTY** (e.g. piping to a file) it degrades to plain
+periodic line output — no ANSI redraws, no garbage. And a render fault is caught
+and logged: **the monitoring engine is primary; the view is disposable** and can
+never take down the loop.
+
 ## Storage
 
 Data is stored in `stockagent.db` (override with `STOCKAGENT_DB`):
@@ -299,10 +391,12 @@ Data is stored in `stockagent.db` (override with `STOCKAGENT_DB`):
 - `fx_rates(date, rate, source, fetched_at)` caches the daily USD→CAD rate
   (`date` is the primary key — one row per day, re-fetches upsert).
 - `signals(id, symbol, kind, code, severity, summary, data, fired_at, cleared_at,
-  active)` persists fired signals. `data` is JSON-encoded; `active = 1` with
-  `cleared_at = NULL` is a live signal. The dedup invariant is **one active row
-  per `(symbol, code)`** while a condition stays true; clearing stamps
+  active, notified_at)` persists fired signals. `data` is JSON-encoded; `active = 1`
+  with `cleared_at = NULL` is a live signal. The dedup invariant is **one active
+  row per `(symbol, code)`** while a condition stays true; clearing stamps
   `cleared_at` and flips `active` to 0, so a re-trigger records a fresh row.
+  `notified_at` (Phase 5, nullable; legacy rows migrate in as `NULL`) stamps when
+  a notification was dispatched for that fire, enforcing fire-once.
 - `alerts(symbol, buy_below, sell_above)` holds user price levels (native
   currency; either bound nullable). `symbol` is the primary key.
 
@@ -326,8 +420,9 @@ npm test     # node --test via tsx over src/**/*.test.ts
 ```
 src/
   index.ts            commander setup, wires subcommands
-  config.ts           load + zod-validate watchlist.yaml
+  config.ts           load + zod-validate watchlist.yaml (incl. notifications)
   db.ts               better-sqlite3 schema + prepared statements
+  monitor.ts          shared poll→signal→notify/display loop (start + dashboard)
   poll.ts             per-minute fetch+upsert cycle, market-hours check
   symbols.ts          symbol normalization + exchange/currency inference
   table.ts            tiny fixed-width table renderer
@@ -358,8 +453,17 @@ src/
     severity.ts       combination step that raises co-occurring conditions
     engine.ts         impure shell: gather data, run generators, dedup + persist
     *.test.ts         synthetic-series unit tests for the above
+  notify/
+    decision.ts       pure notify-decision logic (actionable-only, quiet, coalesce)
+    decision.test.ts  unit tests for the decision + label/framing helpers
+    Notifier.ts       node-notifier delivery: fire-once, throttle, startup-suppress
+    Notifier.test.ts  state-transition tests against a throwaway SQLite DB (mock push)
+  dashboard/
+    snapshot.ts       cache-only point-in-time view model (bars, positions, signals, FX)
+    render.ts         cli-table3 + chalk renderer; plain non-TTY fallback
+    render.test.ts    plain/color render tests (no-ANSI when piped, markers, totals)
   commands/
-    start.ts  bars.ts  status.ts  portfolio.ts  fx.ts  scan.ts  signals.ts  alert.ts
+    start.ts  dashboard.ts  bars.ts  status.ts  portfolio.ts  fx.ts  scan.ts  signals.ts  alert.ts
   scripts/
     smokeAlpaca.ts    one-off live Alpaca bars smoke test
 ```

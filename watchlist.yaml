@@ -21,6 +21,15 @@ preferences:
 #   context:        { nearHighPct: 90, nearLowPct: 10 }
 #   rollup:         { overboughtCount: 2 }
 
+# Optional Phase-5 notification discipline (native macOS pushes for actionable
+# signals only). Keys below show defaults; omit the block to use them. See
+# README "Notifications".
+# notifications:
+#   enabled: true                  # master switch for native pushes
+#   maxPerWindow: 5                # max notifications per window…
+#   windowMinutes: 10              # …over this many minutes (else coalesce to one)
+#   quietHoursOutsideMarket: true  # suppress non-threshold pushes when markets closed
+
 symbols:
   - symbol: AAPL
     exchange: US

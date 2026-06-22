@@ -2,6 +2,7 @@
 import 'dotenv/config';
 import { Command } from 'commander';
 import { registerStart } from './commands/start.js';
+import { registerDashboard } from './commands/dashboard.js';
 import { registerBars } from './commands/bars.js';
 import { registerStatus } from './commands/status.js';
 import { registerPortfolio } from './commands/portfolio.js';
@@ -19,6 +20,7 @@ program
   .version('0.1.0');
 
 registerStart(program);
+registerDashboard(program);
 registerBars(program);
 registerStatus(program);
 registerPortfolio(program);

@@ -96,16 +96,45 @@ const SignalsConfigSchema = z
   })
   .default({});
 
+/**
+ * Phase 5 notification discipline. These knobs govern *delivery*, not analysis —
+ * only `actionable` signals ever push, and these settings keep that channel from
+ * becoming noise. Defaults are deliberately conservative (an alerting tool you
+ * can't trust to stay quiet is one you mute).
+ */
+const NotificationsConfigSchema = z
+  .object({
+    // Master switch for native macOS pushes. The dashboard/`signals` query are
+    // unaffected — this only governs OS notifications.
+    enabled: z.boolean().default(true),
+    // Rate limit: at most `maxPerWindow` pushes per `windowMinutes`. A burst
+    // beyond this coalesces into a single summary notification.
+    maxPerWindow: z.number().int().positive().default(5),
+    windowMinutes: z.number().int().positive().default(10),
+    // When markets are closed, suppress non-threshold actionable pushes (they're
+    // still visible in the dashboard / `signals` query). User-set price
+    // thresholds are hard alerts and push regardless.
+    quietHoursOutsideMarket: z.boolean().default(true),
+  })
+  .default({});
+
 const WatchlistSchema = z.object({
   symbols: z.array(SymbolConfigSchema).min(1, 'watchlist must contain at least one symbol'),
   preferences: PreferencesSchema,
   signals: SignalsConfigSchema,
+  notifications: NotificationsConfigSchema,
 });
 
 export type SymbolConfig = z.infer<typeof SymbolConfigSchema>;
 export type Preferences = z.infer<typeof PreferencesSchema>;
 export type SignalsConfig = z.infer<typeof SignalsConfigSchema>;
+export type NotificationsConfig = z.infer<typeof NotificationsConfigSchema>;
 export type Watchlist = z.infer<typeof WatchlistSchema>;
+
+/** The fully-defaulted notifications config (handy for tests and tooling). */
+export function defaultNotificationsConfig(): NotificationsConfig {
+  return NotificationsConfigSchema.parse(undefined);
+}
 
 /** The fully-defaulted signal-engine config (handy for tests and tooling). */
 export function defaultSignalsConfig(): SignalsConfig {

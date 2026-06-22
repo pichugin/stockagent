@@ -65,6 +65,14 @@ export interface SignalRow {
   firedAt: string; // ISO
   clearedAt: string | null; // ISO, null while active
   active: number; // 1 = active, 0 = cleared
+  /**
+   * Phase 5: ISO timestamp a native notification was dispatched for this fire,
+   * or null if not (yet) notified. Set only on the active-edge of an
+   * `actionable` signal, so a notification fires exactly once per fire and never
+   * re-fires while the condition stays continuously true. A re-trigger after a
+   * clear inserts a fresh row (notified_at NULL), so it can notify again.
+   */
+  notifiedAt: string | null;
 }
 
 /** A user-defined price alert, in the symbol's native currency. */
@@ -107,6 +115,9 @@ export class DB {
   private readonly stmtClearSignal: Database.Statement;
   private readonly stmtSignalHistory: Database.Statement;
   private readonly stmtSignalHistoryForSymbol: Database.Statement;
+  private readonly stmtPendingNotifications: Database.Statement;
+  private readonly stmtMarkNotified: Database.Statement;
+  private readonly stmtSuppressPendingNotifications: Database.Statement;
   private readonly stmtUpsertAlert: Database.Statement;
   private readonly stmtGetAlert: Database.Statement;
   private readonly stmtListAlerts: Database.Statement;
@@ -203,7 +214,7 @@ export class DB {
     );
     const signalCols =
       `id, symbol, kind, code, severity, summary, data,
-       fired_at AS firedAt, cleared_at AS clearedAt, active`;
+       fired_at AS firedAt, cleared_at AS clearedAt, active, notified_at AS notifiedAt`;
     this.stmtActiveSignals = this.db.prepare(
       `SELECT ${signalCols} FROM signals WHERE active = 1 ORDER BY symbol, code`,
     );
@@ -218,6 +229,23 @@ export class DB {
     );
     this.stmtSignalHistoryForSymbol = this.db.prepare(
       `SELECT ${signalCols} FROM signals WHERE symbol = ? ORDER BY fired_at DESC, id DESC LIMIT ?`,
+    );
+
+    // Notification candidates: active, actionable, and not yet notified. Only
+    // these can ever push (the notification firewall against fatigue).
+    this.stmtPendingNotifications = this.db.prepare(
+      `SELECT ${signalCols} FROM signals
+       WHERE active = 1 AND severity = 'actionable' AND notified_at IS NULL
+       ORDER BY symbol, code`,
+    );
+    this.stmtMarkNotified = this.db.prepare(
+      `UPDATE signals SET notified_at = ? WHERE id = ?`,
+    );
+    // Startup suppression: stamp every currently-pending actionable signal as
+    // already-notified so a restart never replays a backlog of pushes.
+    this.stmtSuppressPendingNotifications = this.db.prepare(
+      `UPDATE signals SET notified_at = ?
+       WHERE active = 1 AND severity = 'actionable' AND notified_at IS NULL`,
     );
 
     this.stmtUpsertAlert = this.db.prepare(
@@ -283,10 +311,11 @@ export class DB {
         code       TEXT    NOT NULL,
         severity   TEXT    NOT NULL,
         summary    TEXT    NOT NULL,
-        data       TEXT    NOT NULL,   -- JSON-encoded Signal.data
-        fired_at   TEXT    NOT NULL,   -- ISO
-        cleared_at TEXT,               -- ISO, NULL while active
-        active     INTEGER NOT NULL DEFAULT 1
+        data        TEXT    NOT NULL,  -- JSON-encoded Signal.data
+        fired_at    TEXT    NOT NULL,  -- ISO
+        cleared_at  TEXT,              -- ISO, NULL while active
+        active      INTEGER NOT NULL DEFAULT 1,
+        notified_at TEXT               -- ISO, NULL until a push is dispatched
       );
 
       -- One active row per (symbol, code) is the dedup invariant the engine keeps.
@@ -307,6 +336,13 @@ export class DB {
     const cols = this.db.prepare(`PRAGMA table_info(positions)`).all() as { name: string }[];
     if (!cols.some((c) => c.name === 'fx_at_cost')) {
       this.db.exec(`ALTER TABLE positions ADD COLUMN fx_at_cost REAL`);
+    }
+
+    // Backfill notified_at for DBs created before Phase 5. Same conditional
+    // ADD COLUMN dance as fx_at_cost above.
+    const sigCols = this.db.prepare(`PRAGMA table_info(signals)`).all() as { name: string }[];
+    if (!sigCols.some((c) => c.name === 'notified_at')) {
+      this.db.exec(`ALTER TABLE signals ADD COLUMN notified_at TEXT`);
     }
   }
 
@@ -415,6 +451,29 @@ export class DB {
         ? this.stmtSignalHistoryForSymbol.all(symbol, limit)
         : this.stmtSignalHistory.all(limit)
     ) as SignalRow[];
+  }
+
+  /**
+   * Signals eligible to push a native notification: active, `actionable`, and
+   * not yet notified. The notify dispatcher consumes these and stamps
+   * {@link markNotified} so each fire pushes at most once.
+   */
+  pendingNotifications(): SignalRow[] {
+    return this.stmtPendingNotifications.all() as SignalRow[];
+  }
+
+  /** Record that a notification was dispatched for a signal fire. */
+  markNotified(id: number, at: string): void {
+    this.stmtMarkNotified.run(at, id);
+  }
+
+  /**
+   * Startup suppression: mark every currently-pending actionable signal as
+   * already-notified so re-running `start` doesn't replay a backlog of pushes.
+   * Returns how many were suppressed.
+   */
+  suppressPendingNotifications(at: string): number {
+    return this.stmtSuppressPendingNotifications.run(at).changes;
   }
 
   /** Insert/update a price alert. Pass null for an unset bound. */
