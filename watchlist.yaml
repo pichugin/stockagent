@@ -9,6 +9,18 @@
 preferences:
   cadBias: 0
 
+# Optional signal-engine tuning. Every key below shows its default; omit the
+# whole block (or any key) to use defaults. See README "Signals & alerts".
+# signals:
+#   rsi:            { period: 14, overbought: 70, oversold: 30 }
+#   macd:           { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9 }
+#   movingAverages: { shortPeriod: 50, longPeriod: 200 }
+#   bollinger:      { period: 20, stdDev: 2 }
+#   pnl:            { gainPct: 20, lossPct: 15 }
+#   concentration:  { overweightPct: 25 }
+#   context:        { nearHighPct: 90, nearLowPct: 10 }
+#   rollup:         { overboughtCount: 2 }
+
 symbols:
   - symbol: AAPL
     exchange: US

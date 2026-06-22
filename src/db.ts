@@ -48,6 +48,32 @@ export interface FxRateRow {
   fetchedAt: string; // ISO timestamp
 }
 
+/**
+ * A persisted signal. `data` is the JSON-encoded `Signal.data`. `active` tracks
+ * dedup state: while a condition stays continuously true we keep ONE active row
+ * (`active = 1`, `clearedAt = null`); when it stops being true we set
+ * `active = 0` and stamp `clearedAt`, so a later re-trigger records a fresh fire.
+ */
+export interface SignalRow {
+  id: number;
+  symbol: string;
+  kind: string;
+  code: string;
+  severity: string;
+  summary: string;
+  data: string; // JSON-encoded Signal.data
+  firedAt: string; // ISO
+  clearedAt: string | null; // ISO, null while active
+  active: number; // 1 = active, 0 = cleared
+}
+
+/** A user-defined price alert, in the symbol's native currency. */
+export interface AlertRow {
+  symbol: string;
+  buyBelow: number | null;
+  sellAbove: number | null;
+}
+
 export function dbPath(): string {
   return process.env.STOCKAGENT_DB ?? 'stockagent.db';
 }
@@ -75,6 +101,16 @@ export class DB {
   private readonly stmtUpsertFxRate: Database.Statement;
   private readonly stmtLatestFxRate: Database.Statement;
   private readonly stmtGetFxRate: Database.Statement;
+  private readonly stmtInsertSignal: Database.Statement;
+  private readonly stmtActiveSignals: Database.Statement;
+  private readonly stmtActiveSignalsForSymbol: Database.Statement;
+  private readonly stmtClearSignal: Database.Statement;
+  private readonly stmtSignalHistory: Database.Statement;
+  private readonly stmtSignalHistoryForSymbol: Database.Statement;
+  private readonly stmtUpsertAlert: Database.Statement;
+  private readonly stmtGetAlert: Database.Statement;
+  private readonly stmtListAlerts: Database.Statement;
+  private readonly stmtDeleteAlert: Database.Statement;
 
   constructor(path: string = dbPath()) {
     this.db = new Database(path);
@@ -160,6 +196,44 @@ export class DB {
     this.stmtGetFxRate = this.db.prepare(
       `SELECT date, rate, source, fetched_at AS fetchedAt FROM fx_rates WHERE date = ?`,
     );
+
+    this.stmtInsertSignal = this.db.prepare(
+      `INSERT INTO signals (symbol, kind, code, severity, summary, data, fired_at, cleared_at, active)
+       VALUES (@symbol, @kind, @code, @severity, @summary, @data, @firedAt, NULL, 1)`,
+    );
+    const signalCols =
+      `id, symbol, kind, code, severity, summary, data,
+       fired_at AS firedAt, cleared_at AS clearedAt, active`;
+    this.stmtActiveSignals = this.db.prepare(
+      `SELECT ${signalCols} FROM signals WHERE active = 1 ORDER BY symbol, code`,
+    );
+    this.stmtActiveSignalsForSymbol = this.db.prepare(
+      `SELECT ${signalCols} FROM signals WHERE active = 1 AND symbol = ? ORDER BY code`,
+    );
+    this.stmtClearSignal = this.db.prepare(
+      `UPDATE signals SET active = 0, cleared_at = ? WHERE id = ?`,
+    );
+    this.stmtSignalHistory = this.db.prepare(
+      `SELECT ${signalCols} FROM signals ORDER BY fired_at DESC, id DESC LIMIT ?`,
+    );
+    this.stmtSignalHistoryForSymbol = this.db.prepare(
+      `SELECT ${signalCols} FROM signals WHERE symbol = ? ORDER BY fired_at DESC, id DESC LIMIT ?`,
+    );
+
+    this.stmtUpsertAlert = this.db.prepare(
+      `INSERT INTO alerts (symbol, buy_below, sell_above)
+       VALUES (@symbol, @buyBelow, @sellAbove)
+       ON CONFLICT(symbol) DO UPDATE SET
+         buy_below  = excluded.buy_below,
+         sell_above = excluded.sell_above`,
+    );
+    this.stmtGetAlert = this.db.prepare(
+      `SELECT symbol, buy_below AS buyBelow, sell_above AS sellAbove FROM alerts WHERE symbol = ?`,
+    );
+    this.stmtListAlerts = this.db.prepare(
+      `SELECT symbol, buy_below AS buyBelow, sell_above AS sellAbove FROM alerts ORDER BY symbol`,
+    );
+    this.stmtDeleteAlert = this.db.prepare(`DELETE FROM alerts WHERE symbol = ?`);
   }
 
   private migrate(): void {
@@ -200,6 +274,31 @@ export class DB {
         rate       REAL NOT NULL,      -- 1 USD = rate CAD (canonical direction)
         source     TEXT NOT NULL,
         fetched_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS signals (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol     TEXT    NOT NULL,
+        kind       TEXT    NOT NULL,
+        code       TEXT    NOT NULL,
+        severity   TEXT    NOT NULL,
+        summary    TEXT    NOT NULL,
+        data       TEXT    NOT NULL,   -- JSON-encoded Signal.data
+        fired_at   TEXT    NOT NULL,   -- ISO
+        cleared_at TEXT,               -- ISO, NULL while active
+        active     INTEGER NOT NULL DEFAULT 1
+      );
+
+      -- One active row per (symbol, code) is the dedup invariant the engine keeps.
+      CREATE INDEX IF NOT EXISTS idx_signals_active
+        ON signals (symbol, code, active);
+      CREATE INDEX IF NOT EXISTS idx_signals_fired
+        ON signals (fired_at DESC);
+
+      CREATE TABLE IF NOT EXISTS alerts (
+        symbol     TEXT PRIMARY KEY,
+        buy_below  REAL,               -- fire when latest close <= this (native ccy)
+        sell_above REAL                -- fire when latest close >= this (native ccy)
       );
     `);
 
@@ -280,6 +379,60 @@ export class DB {
   /** The cached FX rate for a specific ISO date, or null. */
   getFxRate(date: string): FxRateRow | null {
     return (this.stmtGetFxRate.get(date) as FxRateRow | undefined) ?? null;
+  }
+
+  /** Fire a new active signal. `data` must be a JSON string. Returns its id. */
+  insertSignal(row: {
+    symbol: string;
+    kind: string;
+    code: string;
+    severity: string;
+    summary: string;
+    data: string;
+    firedAt: string;
+  }): number {
+    return Number(this.stmtInsertSignal.run(row).lastInsertRowid);
+  }
+
+  /** Currently-active signals (optionally for one symbol). */
+  activeSignals(symbol?: string): SignalRow[] {
+    return (
+      symbol
+        ? this.stmtActiveSignalsForSymbol.all(symbol)
+        : this.stmtActiveSignals.all()
+    ) as SignalRow[];
+  }
+
+  /** Mark an active signal cleared (condition no longer true). */
+  clearSignal(id: number, clearedAt: string): void {
+    this.stmtClearSignal.run(clearedAt, id);
+  }
+
+  /** Most recent signals (active or cleared), newest first. */
+  signalHistory(limit: number, symbol?: string): SignalRow[] {
+    return (
+      symbol
+        ? this.stmtSignalHistoryForSymbol.all(symbol, limit)
+        : this.stmtSignalHistory.all(limit)
+    ) as SignalRow[];
+  }
+
+  /** Insert/update a price alert. Pass null for an unset bound. */
+  upsertAlert(row: AlertRow): void {
+    this.stmtUpsertAlert.run(row);
+  }
+
+  getAlert(symbol: string): AlertRow | null {
+    return (this.stmtGetAlert.get(symbol) as AlertRow | undefined) ?? null;
+  }
+
+  listAlerts(): AlertRow[] {
+    return this.stmtListAlerts.all() as AlertRow[];
+  }
+
+  /** Delete an alert; returns true if a row was actually removed. */
+  deleteAlert(symbol: string): boolean {
+    return this.stmtDeleteAlert.run(symbol).changes > 0;
   }
 
   close(): void {

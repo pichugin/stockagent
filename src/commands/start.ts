@@ -6,6 +6,7 @@ import { DB } from '../db.js';
 import { FxService } from '../fx/FxService.js';
 import { isMarketHours, runPollCycle } from '../poll.js';
 import { SqlitePortfolioProvider } from '../portfolio/SqlitePortfolioProvider.js';
+import { computeSignals, persistSignals } from '../signals/engine.js';
 import { inferSymbolMeta } from '../symbols.js';
 import { errMsg, log } from '../util.js';
 
@@ -89,6 +90,28 @@ export function registerStart(program: Command): void {
             return;
           }
           await runPollCycle(db, polled, { limit });
+
+          // Recompute signals after each poll. Isolated from the poll loop: a
+          // failure here is logged and swallowed, never stopping the cadence
+          // (same resilience contract as Phase 1's per-symbol isolation).
+          try {
+            const now = new Date().toISOString();
+            const result = await computeSignals(
+              db,
+              portfolio,
+              fx,
+              watchlist.signals,
+              polled.symbols.map((s) => s.symbol),
+              now,
+            );
+            const rec = persistSignals(db, result.signals, now);
+            log.info(
+              `signals — ${rec.fired} new, ${rec.kept} active, ${rec.cleared} cleared` +
+                (result.insufficient.length ? `, ${result.insufficient.length} insufficient_data` : ''),
+            );
+          } catch (err) {
+            log.error(`signal computation failed (poll loop continues): ${errMsg(err)}`);
+          }
         } catch (err) {
           // Belt-and-suspenders: runPollCycle isolates per-symbol errors, but
           // never let an unexpected throw kill the scheduler.
