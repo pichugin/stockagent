@@ -16,6 +16,8 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js start",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
+    "smoke:alpaca": "tsx src/scripts/smokeAlpaca.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {

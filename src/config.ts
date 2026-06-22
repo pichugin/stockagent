@@ -12,11 +12,29 @@ const SymbolConfigSchema = z.object({
   currency: z.enum(['USD', 'CAD']),
 });
 
+/**
+ * User preferences. Phase 3 introduces `cadBias` as a *parsed-and-validated
+ * stub only*: a knob the later signal layer will read to tilt ranking toward
+ * CAD exposure. Nothing in this phase acts on it. Range is [-1, 1] where 0 is
+ * neutral, positive favours CAD, negative favours USD.
+ */
+const PreferencesSchema = z
+  .object({
+    cadBias: z
+      .number({ invalid_type_error: 'preferences.cadBias must be a number' })
+      .min(-1, 'preferences.cadBias must be >= -1')
+      .max(1, 'preferences.cadBias must be <= 1')
+      .default(0),
+  })
+  .default({ cadBias: 0 });
+
 const WatchlistSchema = z.object({
   symbols: z.array(SymbolConfigSchema).min(1, 'watchlist must contain at least one symbol'),
+  preferences: PreferencesSchema,
 });
 
 export type SymbolConfig = z.infer<typeof SymbolConfigSchema>;
+export type Preferences = z.infer<typeof PreferencesSchema>;
 export type Watchlist = z.infer<typeof WatchlistSchema>;
 
 export function watchlistPath(): string {

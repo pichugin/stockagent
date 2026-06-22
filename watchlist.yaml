@@ -2,6 +2,13 @@
 # Each symbol routes to a provider based on its exchange:
 #   US  -> Alpaca (if ALPACA_KEY/SECRET set) else yahoo-finance2 fallback
 #   TSX -> yahoo-finance2  (use the Yahoo ".TO" suffix in `symbol`)
+
+# Optional user preferences. cadBias is a parsed-and-validated stub for the
+# later signal layer (range [-1, 1]; 0 neutral, >0 favours CAD). Nothing acts
+# on it yet.
+preferences:
+  cadBias: 0
+
 symbols:
   - symbol: AAPL
     exchange: US

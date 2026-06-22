@@ -1,4 +1,7 @@
 import type { Watchlist } from './config.js';
+
+/** The polling loop only needs the symbol list, not the full validated config. */
+type PollTargets = Pick<Watchlist, 'symbols'>;
 import { DB } from './db.js';
 import { getProviderForSymbol } from './providers/index.js';
 import { errMsg, log, withRetry } from './util.js';
@@ -41,7 +44,7 @@ export interface PollOpts {
  */
 export async function runPollCycle(
   db: DB,
-  watchlist: Watchlist,
+  watchlist: PollTargets,
   opts: PollOpts = {},
 ): Promise<void> {
   const limit = opts.limit ?? 5;

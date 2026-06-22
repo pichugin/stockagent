@@ -5,6 +5,7 @@ import { registerStart } from './commands/start.js';
 import { registerBars } from './commands/bars.js';
 import { registerStatus } from './commands/status.js';
 import { registerPortfolio } from './commands/portfolio.js';
+import { registerFx } from './commands/fx.js';
 import { errMsg } from './util.js';
 
 const program = new Command();
@@ -18,6 +19,7 @@ registerStart(program);
 registerBars(program);
 registerStatus(program);
 registerPortfolio(program);
+registerFx(program);
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(`stockagent: ${errMsg(err)}`);

@@ -14,6 +14,7 @@ function rowToPosition(row: PositionRow): Position {
     avgCost: row.avgCost,
     currency: row.currency as Currency,
     dateAdded: row.dateAdded,
+    fxAtCost: row.fxAtCost,
     ...(row.note != null ? { note: row.note } : {}),
   };
 }
@@ -40,6 +41,9 @@ export class SqlitePortfolioProvider implements PortfolioProvider {
     // caller explicitly supplies one.
     const existing = this.db.getPosition(symbol);
     const dateAdded = p.dateAdded ?? existing?.dateAdded ?? new Date().toISOString();
+    // Preserve the original cost-basis FX snapshot across edits unless the
+    // caller explicitly supplies one (e.g. a fresh `add`).
+    const fxAtCost = p.fxAtCost !== undefined ? p.fxAtCost : (existing?.fxAtCost ?? null);
 
     const row: PositionRow = {
       symbol,
@@ -48,6 +52,7 @@ export class SqlitePortfolioProvider implements PortfolioProvider {
       currency: p.currency,
       dateAdded,
       note: p.note ?? null,
+      fxAtCost,
     };
     this.db.upsertPosition(row);
     return rowToPosition(row);

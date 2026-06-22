@@ -3,6 +3,7 @@ import cron from 'node-cron';
 import { loadWatchlist } from '../config.js';
 import type { SymbolConfig, Watchlist } from '../config.js';
 import { DB } from '../db.js';
+import { FxService } from '../fx/FxService.js';
 import { isMarketHours, runPollCycle } from '../poll.js';
 import { SqlitePortfolioProvider } from '../portfolio/SqlitePortfolioProvider.js';
 import { inferSymbolMeta } from '../symbols.js';
@@ -48,12 +49,31 @@ export function registerStart(program: Command): void {
         db.upsertSymbol(meta);
         bySymbol.set(p.symbol, meta);
       }
-      const polled: Watchlist = { symbols: [...bySymbol.values()] };
+      const polled: Pick<Watchlist, 'symbols'> = { symbols: [...bySymbol.values()] };
 
       log.info(
         `watching ${polled.symbols.length} symbols: ` +
           polled.symbols.map((s) => s.symbol).join(', '),
       );
+
+      // FX runs on a separate, daily cadence so a slow/failed FX fetch never
+      // delays or blocks the per-minute bar polling. Refresh only when the
+      // cached rate isn't already current.
+      const fx = new FxService(db);
+      const refreshFx = async () => {
+        try {
+          const cached = fx.cached();
+          if (cached && !cached.stale) return;
+          const view = await fx.refresh();
+          log.info(`FX refreshed: 1 USD = ${view.rate.toFixed(4)} CAD (as of ${view.asOf})`);
+        } catch (err) {
+          log.warn(`FX refresh failed: ${errMsg(err)} (portfolio reads fall back to cache)`);
+        }
+      };
+      // Kick off an initial refresh without awaiting it, so the first bar cycle
+      // starts immediately regardless of FX latency. We keep the promise so the
+      // one-shot path can await it before closing the DB.
+      const initialFx = refreshFx();
 
       let running = false;
       const cycle = async () => {
@@ -82,16 +102,21 @@ export function registerStart(program: Command): void {
       await cycle();
 
       if (opts.once) {
+        // Let the in-flight FX refresh finish writing before we close the DB.
+        await initialFx;
         db.close();
         return;
       }
 
       const task = cron.schedule('* * * * *', cycle);
-      log.info('scheduled per-minute polling — press Ctrl-C to stop');
+      // Daily FX refresh at midnight; the refresh itself no-ops if already current.
+      const fxTask = cron.schedule('0 0 * * *', refreshFx);
+      log.info('scheduled per-minute polling + daily FX refresh — press Ctrl-C to stop');
 
       const shutdown = () => {
         log.info('shutting down…');
         task.stop();
+        fxTask.stop();
         db.close();
         process.exit(0);
       };

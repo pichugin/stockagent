@@ -32,6 +32,20 @@ export interface PositionRow {
   currency: string;
   dateAdded: string;
   note: string | null;
+  /**
+   * Canonical USD→CAD rate snapshotted when the position was added, enabling an
+   * exact underlying-vs-FX decomposition of its cost basis. Null for legacy
+   * rows added before the snapshot existed (FX split unavailable for those).
+   */
+  fxAtCost: number | null;
+}
+
+/** A cached daily FX observation (canonical USD→CAD direction only). */
+export interface FxRateRow {
+  date: string; // ISO date YYYY-MM-DD (primary key)
+  rate: number; // 1 USD = `rate` CAD
+  source: string;
+  fetchedAt: string; // ISO timestamp
 }
 
 export function dbPath(): string {
@@ -58,6 +72,9 @@ export class DB {
   private readonly stmtGetPosition: Database.Statement;
   private readonly stmtListPositions: Database.Statement;
   private readonly stmtDeletePosition: Database.Statement;
+  private readonly stmtUpsertFxRate: Database.Statement;
+  private readonly stmtLatestFxRate: Database.Statement;
+  private readonly stmtGetFxRate: Database.Statement;
 
   constructor(path: string = dbPath()) {
     this.db = new Database(path);
@@ -106,24 +123,43 @@ export class DB {
     );
 
     this.stmtUpsertPosition = this.db.prepare(
-      `INSERT INTO positions (symbol, shares, avg_cost, currency, date_added, note)
-       VALUES (@symbol, @shares, @avgCost, @currency, @dateAdded, @note)
+      `INSERT INTO positions (symbol, shares, avg_cost, currency, date_added, note, fx_at_cost)
+       VALUES (@symbol, @shares, @avgCost, @currency, @dateAdded, @note, @fxAtCost)
        ON CONFLICT(symbol) DO UPDATE SET
-         shares     = excluded.shares,
-         avg_cost   = excluded.avg_cost,
-         currency   = excluded.currency,
-         date_added = excluded.date_added,
-         note       = excluded.note`,
+         shares      = excluded.shares,
+         avg_cost    = excluded.avg_cost,
+         currency    = excluded.currency,
+         date_added  = excluded.date_added,
+         note        = excluded.note,
+         fx_at_cost  = excluded.fx_at_cost`,
     );
     this.stmtGetPosition = this.db.prepare(
-      `SELECT symbol, shares, avg_cost AS avgCost, currency, date_added AS dateAdded, note
+      `SELECT symbol, shares, avg_cost AS avgCost, currency, date_added AS dateAdded,
+              note, fx_at_cost AS fxAtCost
        FROM positions WHERE symbol = ?`,
     );
     this.stmtListPositions = this.db.prepare(
-      `SELECT symbol, shares, avg_cost AS avgCost, currency, date_added AS dateAdded, note
+      `SELECT symbol, shares, avg_cost AS avgCost, currency, date_added AS dateAdded,
+              note, fx_at_cost AS fxAtCost
        FROM positions ORDER BY symbol`,
     );
     this.stmtDeletePosition = this.db.prepare(`DELETE FROM positions WHERE symbol = ?`);
+
+    this.stmtUpsertFxRate = this.db.prepare(
+      `INSERT INTO fx_rates (date, rate, source, fetched_at)
+       VALUES (@date, @rate, @source, @fetchedAt)
+       ON CONFLICT(date) DO UPDATE SET
+         rate       = excluded.rate,
+         source     = excluded.source,
+         fetched_at = excluded.fetched_at`,
+    );
+    this.stmtLatestFxRate = this.db.prepare(
+      `SELECT date, rate, source, fetched_at AS fetchedAt
+       FROM fx_rates ORDER BY date DESC LIMIT 1`,
+    );
+    this.stmtGetFxRate = this.db.prepare(
+      `SELECT date, rate, source, fetched_at AS fetchedAt FROM fx_rates WHERE date = ?`,
+    );
   }
 
   private migrate(): void {
@@ -155,9 +191,24 @@ export class DB {
         avg_cost   REAL NOT NULL,
         currency   TEXT NOT NULL,
         date_added TEXT NOT NULL,
-        note       TEXT
+        note       TEXT,
+        fx_at_cost REAL
+      );
+
+      CREATE TABLE IF NOT EXISTS fx_rates (
+        date       TEXT PRIMARY KEY,   -- ISO date YYYY-MM-DD
+        rate       REAL NOT NULL,      -- 1 USD = rate CAD (canonical direction)
+        source     TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
       );
     `);
+
+    // Backfill fx_at_cost for DBs created before Phase 3. ADD COLUMN is a no-op
+    // to express conditionally, so we probe the column list first.
+    const cols = this.db.prepare(`PRAGMA table_info(positions)`).all() as { name: string }[];
+    if (!cols.some((c) => c.name === 'fx_at_cost')) {
+      this.db.exec(`ALTER TABLE positions ADD COLUMN fx_at_cost REAL`);
+    }
   }
 
   /** Insert/update the watchlist metadata for a symbol. */
@@ -214,6 +265,21 @@ export class DB {
   /** Delete a position; returns true if a row was actually removed. */
   deletePosition(symbol: string): boolean {
     return this.stmtDeletePosition.run(symbol).changes > 0;
+  }
+
+  /** Upsert a daily FX rate; re-fetching the same date overwrites in place. */
+  upsertFxRate(row: FxRateRow): void {
+    this.stmtUpsertFxRate.run(row);
+  }
+
+  /** Most recently dated cached FX rate, or null if none cached yet. */
+  latestFxRate(): FxRateRow | null {
+    return (this.stmtLatestFxRate.get() as FxRateRow | undefined) ?? null;
+  }
+
+  /** The cached FX rate for a specific ISO date, or null. */
+  getFxRate(date: string): FxRateRow | null {
+    return (this.stmtGetFxRate.get(date) as FxRateRow | undefined) ?? null;
   }
 
   close(): void {

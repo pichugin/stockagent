@@ -8,6 +8,13 @@ export interface Position {
   currency: Currency;
   dateAdded: string; // ISO 8601
   note?: string;
+  /**
+   * Canonical USD→CAD rate captured when the position was added, so the cost
+   * basis can be decomposed into underlying vs FX. For CAD positions this is 1
+   * (FX is a no-op). Null for legacy rows added before snapshots existed — the
+   * FX split is then reported as unavailable rather than guessed.
+   */
+  fxAtCost?: number | null;
 }
 
 /** Shape accepted by `upsert`: `dateAdded` is optional (defaulted/preserved). */

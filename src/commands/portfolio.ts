@@ -1,11 +1,15 @@
 import type { Command } from 'commander';
 import { z } from 'zod';
 import { DB } from '../db.js';
+import { decomposeCostBasisFx } from '../fx/convert.js';
+import { FxService } from '../fx/FxService.js';
+import type { FxRateView } from '../fx/FxService.js';
+import { WS_SPREAD_NOTE } from '../fx/notes.js';
 import type { Currency, Position } from '../portfolio/PortfolioProvider.js';
 import { SqlitePortfolioProvider } from '../portfolio/SqlitePortfolioProvider.js';
 import { inferSymbolMeta, normalizeSymbol } from '../symbols.js';
 import { renderTable } from '../table.js';
-import { log } from '../util.js';
+import { errMsg, log } from '../util.js';
 
 const sharesSchema = z.coerce
   .number({ invalid_type_error: 'shares must be a number' })
@@ -43,6 +47,26 @@ function resolveCurrency(
   if (known) return known.currency as Currency;
 
   return inferSymbolMeta(symbol).currency;
+}
+
+/**
+ * The canonical USD→CAD rate to lock in as a position's cost-basis FX snapshot.
+ * CAD positions return 1 (no FX exposure, no network needed). USD positions
+ * use the current cached/live rate; if FX is entirely unavailable we return
+ * null so the position records "FX split unavailable" rather than a guess.
+ */
+async function snapshotFxAtCost(db: DB, currency: Currency): Promise<number | null> {
+  if (currency === 'CAD') return 1;
+  try {
+    const view = await new FxService(db).ensureRate();
+    if (view.stale) {
+      log.warn(`snapshotting cost-basis FX from a stale rate (as of ${view.asOf})`);
+    }
+    return view.rate;
+  } catch (err) {
+    log.warn(`could not snapshot cost-basis FX (${errMsg(err)}); FX split will be unavailable for this position`);
+    return null;
+  }
 }
 
 function printPosition(p: Position): void {
@@ -107,7 +131,13 @@ export function registerPortfolio(program: Command): void {
         const { exchange } = inferSymbolMeta(symbol);
         db.upsertSymbol({ symbol, exchange, currency });
 
-        const position = await portfolio.upsert({ symbol, shares, avgCost, currency, note: opts.note });
+        // Snapshot the USD→CAD rate at cost basis so the FX split is exact later.
+        // CAD positions have no FX exposure (snapshot 1). For USD positions we
+        // need a live/cached rate; if none is available, store null and note the
+        // split will be unavailable rather than guess.
+        const fxAtCost = await snapshotFxAtCost(db, currency);
+
+        const position = await portfolio.upsert({ symbol, shares, avgCost, currency, note: opts.note, fxAtCost });
         console.log(`Saved position for ${symbol}:\n`);
         printPosition(position);
       } finally {
@@ -176,7 +206,7 @@ export function registerPortfolio(program: Command): void {
 
   program
     .command('show')
-    .description('List all held positions (native currency only — no FX in this phase).')
+    .description('List held positions with native cost basis and CAD-normalized cost basis.')
     .action(async () => {
       const db = new DB();
       const portfolio = new SqlitePortfolioProvider(db);
@@ -187,7 +217,8 @@ export function registerPortfolio(program: Command): void {
           return;
         }
 
-        const rows = positions.map((p) => [
+        // Native-currency view (unchanged from Phase 2).
+        const nativeRows = positions.map((p) => [
           p.symbol,
           String(p.shares),
           p.avgCost.toFixed(2),
@@ -196,24 +227,84 @@ export function registerPortfolio(program: Command): void {
           p.dateAdded,
           p.note ?? '',
         ]);
-
         console.log(
           renderTable(
             ['Symbol', 'Shares', 'Avg Cost', 'Ccy', 'Cost Basis', 'Date Added', 'Note'],
-            rows,
+            nativeRows,
           ),
         );
 
-        // Per-currency subtotals only — summing across currencies without FX
-        // would be wrong (FX normalization is Phase 3).
+        // Per-currency native subtotals (kept — no FX assumptions).
         const subtotals = new Map<string, number>();
         for (const p of positions) {
           subtotals.set(p.currency, (subtotals.get(p.currency) ?? 0) + p.shares * p.avgCost);
         }
-        console.log('\nCost basis by currency:');
+        console.log('\nCost basis by currency (native):');
         for (const [ccy, total] of [...subtotals].sort()) {
           console.log(`  ${ccy}: ${total.toFixed(2)}`);
         }
+
+        // CAD-normalized cost basis. Read FX from cache (refresh-if-needed);
+        // never let an FX outage block listing positions.
+        let fx: FxRateView;
+        try {
+          fx = await new FxService(db).ensureRate();
+        } catch (err) {
+          console.log(`\nCAD-normalized view unavailable: ${errMsg(err)}`);
+          return;
+        }
+
+        const cadRows: string[][] = [];
+        let cadGrandTotal = 0;
+        for (const p of positions) {
+          // CAD positions have no FX exposure; treat their snapshot as 1.
+          const fxNow = p.currency === 'USD' ? fx.rate : 1;
+          const f0 = p.currency === 'CAD' ? 1 : p.fxAtCost;
+
+          if (f0 == null) {
+            // Legacy USD row without a cost-basis snapshot: convert at current
+            // rate but report the underlying-vs-FX split as unavailable.
+            const d = decomposeCostBasisFx(p.shares, p.avgCost, fxNow, fxNow);
+            cadGrandTotal += d.cadAtCurrent;
+            cadRows.push([
+              p.symbol,
+              p.currency,
+              d.native.toFixed(2),
+              '?',
+              fxNow.toFixed(4),
+              d.cadAtCurrent.toFixed(2),
+              'n/a',
+            ]);
+            continue;
+          }
+
+          const d = decomposeCostBasisFx(p.shares, p.avgCost, f0, fxNow);
+          cadGrandTotal += d.cadAtCurrent;
+          cadRows.push([
+            p.symbol,
+            p.currency,
+            d.native.toFixed(2),
+            f0.toFixed(4),
+            fxNow.toFixed(4),
+            d.cadAtCurrent.toFixed(2),
+            d.fxComponent.toFixed(2),
+          ]);
+        }
+
+        console.log(`\nCost basis in CAD (at FX rate as of ${fx.asOf}${fx.stale ? ', ⚠ STALE' : ''}):`);
+        console.log(
+          renderTable(
+            ['Symbol', 'Ccy', 'Native', 'FX@cost', 'FX@now', 'CAD @now', 'FX Δ (CAD)'],
+            cadRows,
+          ),
+        );
+        console.log(`\nCAD grand total (cost basis, at rate as of ${fx.asOf}): ${cadGrandTotal.toFixed(2)} CAD`);
+        console.log(
+          '  "FX Δ (CAD)" = how much the CAD value of the cost basis has moved purely from USD/CAD\n' +
+            '  shifting since purchase (approximate; underlying-move split arrives with live prices). ' +
+            '"n/a" = no cost-basis FX snapshot.',
+        );
+        console.log(`\n${WS_SPREAD_NOTE}`);
       } finally {
         db.close();
       }
