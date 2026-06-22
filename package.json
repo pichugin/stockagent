@@ -1,0 +1,37 @@
+{
+  "name": "stockagent",
+  "version": "0.1.0",
+  "description": "Personal stock monitoring & decision-support agent for macOS (Phase 1: data + storage foundation).",
+  "type": "module",
+  "bin": {
+    "stockagent": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js start",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "commander": "^13.1.0",
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3",
+    "yahoo-finance2": "^3.15.3",
+    "yaml": "^2.7.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.13.5",
+    "@types/node-cron": "^3.0.11",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,17 @@
+# StockAgent watchlist.
+# Each symbol routes to a provider based on its exchange:
+#   US  -> Alpaca (if ALPACA_KEY/SECRET set) else yahoo-finance2 fallback
+#   TSX -> yahoo-finance2  (use the Yahoo ".TO" suffix in `symbol`)
+symbols:
+  - symbol: AAPL
+    exchange: US
+    currency: USD
+  - symbol: NVDA
+    exchange: US
+    currency: USD
+  - symbol: SHOP.TO
+    exchange: TSX
+    currency: CAD
+  - symbol: TD.TO
+    exchange: TSX
+    currency: CAD
