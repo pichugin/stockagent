@@ -1,8 +1,11 @@
 import type { Command } from 'commander';
 import cron from 'node-cron';
 import { loadWatchlist } from '../config.js';
+import type { SymbolConfig, Watchlist } from '../config.js';
 import { DB } from '../db.js';
 import { isMarketHours, runPollCycle } from '../poll.js';
+import { SqlitePortfolioProvider } from '../portfolio/SqlitePortfolioProvider.js';
+import { inferSymbolMeta } from '../symbols.js';
 import { errMsg, log } from '../util.js';
 
 interface StartOptions {
@@ -28,9 +31,28 @@ export function registerStart(program: Command): void {
       const db = new DB();
       for (const meta of watchlist.symbols) db.upsertSymbol(meta);
 
+      // Poll the union of watchlist symbols and held positions, so holdings get
+      // bars even when they aren't in watchlist.yaml. Watchlist metadata wins on
+      // conflict; held-only symbols infer their exchange from the suffix and keep
+      // the position's currency.
+      const portfolio = new SqlitePortfolioProvider(db);
+      const bySymbol = new Map<string, SymbolConfig>();
+      for (const meta of watchlist.symbols) bySymbol.set(meta.symbol, meta);
+      for (const p of await portfolio.list()) {
+        if (bySymbol.has(p.symbol)) continue;
+        const meta: SymbolConfig = {
+          symbol: p.symbol,
+          exchange: inferSymbolMeta(p.symbol).exchange,
+          currency: p.currency,
+        };
+        db.upsertSymbol(meta);
+        bySymbol.set(p.symbol, meta);
+      }
+      const polled: Watchlist = { symbols: [...bySymbol.values()] };
+
       log.info(
-        `watching ${watchlist.symbols.length} symbols: ` +
-          watchlist.symbols.map((s) => s.symbol).join(', '),
+        `watching ${polled.symbols.length} symbols: ` +
+          polled.symbols.map((s) => s.symbol).join(', '),
       );
 
       let running = false;
@@ -46,7 +68,7 @@ export function registerStart(program: Command): void {
             log.info('markets appear closed — skipping (use --force to override)');
             return;
           }
-          await runPollCycle(db, watchlist, { limit });
+          await runPollCycle(db, polled, { limit });
         } catch (err) {
           // Belt-and-suspenders: runPollCycle isolates per-symbol errors, but
           // never let an unexpected throw kill the scheduler.

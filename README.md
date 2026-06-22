@@ -1,9 +1,16 @@
-# StockAgent — Phase 1 (data + storage)
+# StockAgent — Phases 1–2 (data, storage & portfolio)
 
-A personal stock monitoring agent for macOS (CLI-first). **Phase 1** is the data
-foundation only: it polls a watchlist every minute and caches OHLCV bars in
-SQLite across US (Alpaca) and TSX (`yahoo-finance2`) symbols. No signals,
-portfolio, FX, notifications, or LLM yet.
+A personal stock monitoring agent for macOS (CLI-first).
+
+- **Phase 1** is the data foundation: it polls a watchlist every minute and
+  caches OHLCV bars in SQLite across US (Alpaca) and TSX (`yahoo-finance2`)
+  symbols.
+- **Phase 2** adds a **portfolio layer** — record what you actually hold via CLI
+  subcommands, stored in SQLite behind a backend-agnostic `PortfolioProvider`
+  interface (so a future auto-sync backend can drop in). Held symbols are also
+  polled for bars, even if they aren't in `watchlist.yaml`.
+
+No FX conversion, live prices, signals, notifications, or LLM yet (later phases).
 
 ## Requirements
 
@@ -68,6 +75,44 @@ node dist/index.js status
 A provider/network/rate-limit error for one symbol is caught, logged, and
 retried with backoff — it never crashes the loop or blocks other symbols.
 
+`start` polls the **union of watchlist symbols and held positions**
+(de-duplicated), so anything in your portfolio gets bars even if it isn't in
+`watchlist.yaml`.
+
+## Portfolio
+
+Record what you hold. Amounts are in each position's **native currency** — there
+is no FX conversion or cross-currency total in this phase, so `show` reports
+per-currency cost-basis subtotals only.
+
+```bash
+# Add (or overwrite) a position. Currency: explicit --cad/--usd wins; otherwise
+# it's inferred (.TO -> CAD, else USD).
+node dist/index.js add AAPL 10 --cost 180 --usd
+node dist/index.js add SHOP.TO 50 --cost 95 --cad
+node dist/index.js add ENB.TO 100 --cost 50            # infers CAD
+node dist/index.js add MSFT 3 --cost 400               # infers USD
+node dist/index.js add AAPL 10 --cost 180 --usd --note "long-term"
+
+# Partially update an existing position (only the fields you pass)
+node dist/index.js edit AAPL --shares 12
+node dist/index.js edit AAPL --cost 175 --note "added on dip"
+
+# List all positions (symbol, shares, avg cost, currency, cost basis, …)
+node dist/index.js show
+
+# Remove a position
+node dist/index.js remove SHOP.TO
+```
+
+- **`add`** is a full upsert: re-adding an existing symbol overwrites it (with a
+  warning) and keeps the original `dateAdded`. Shares must be `> 0`, cost `>= 0`.
+- **`edit`** only touches the fields you pass and never creates — editing a
+  symbol you don't hold is an error.
+- Symbols are upper-cased on input (`aapl` == `AAPL`); the `.TO` suffix is kept.
+- Adding a position also registers its routing metadata, so it starts getting
+  polled on the next `start`.
+
 ## Storage
 
 Data is stored in `stockagent.db` (override with `STOCKAGENT_DB`):
@@ -77,6 +122,8 @@ Data is stored in `stockagent.db` (override with `STOCKAGENT_DB`):
   duplicate.
 - `symbols(symbol, exchange, currency, last_fetch)` for watchlist metadata and
   per-symbol last-fetch tracking.
+- `positions(symbol, shares, avg_cost, currency, date_added, note)` for held
+  positions (`symbol` is the primary key — one position per symbol).
 
 Timestamps are epoch-milliseconds (UTC).
 
@@ -88,6 +135,7 @@ src/
   config.ts           load + zod-validate watchlist.yaml
   db.ts               better-sqlite3 schema + prepared statements
   poll.ts             per-minute fetch+upsert cycle, market-hours check
+  symbols.ts          symbol normalization + exchange/currency inference
   table.ts            tiny fixed-width table renderer
   util.ts             logging, sleep, retry-with-backoff
   providers/
@@ -95,6 +143,9 @@ src/
     alpaca.ts         US bars (Alpaca IEX feed)
     yahoo.ts          TSX + key-less fallback (yahoo-finance2)
     index.ts          routes a symbol to the right provider
+  portfolio/
+    PortfolioProvider.ts      backend-agnostic portfolio interface + Position
+    SqlitePortfolioProvider.ts  v1 SQLite-backed implementation
   commands/
-    start.ts  bars.ts  status.ts
+    start.ts  bars.ts  status.ts  portfolio.ts
 ```

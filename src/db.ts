@@ -20,6 +20,20 @@ export interface SymbolStatus {
   barCount: number;
 }
 
+/**
+ * Storage shape of a held position (camelCase, mapped from snake_case columns).
+ * Kept separate from the portfolio layer's `Position` so SQLite specifics never
+ * leak into the backend-agnostic `PortfolioProvider` interface.
+ */
+export interface PositionRow {
+  symbol: string;
+  shares: number;
+  avgCost: number;
+  currency: string;
+  dateAdded: string;
+  note: string | null;
+}
+
 export function dbPath(): string {
   return process.env.STOCKAGENT_DB ?? 'stockagent.db';
 }
@@ -39,6 +53,11 @@ export class DB {
   private readonly stmtUpsertSymbol: Database.Statement;
   private readonly stmtMarkFetched: Database.Statement;
   private readonly stmtSymbolStatuses: Database.Statement;
+  private readonly stmtGetSymbol: Database.Statement;
+  private readonly stmtUpsertPosition: Database.Statement;
+  private readonly stmtGetPosition: Database.Statement;
+  private readonly stmtListPositions: Database.Statement;
+  private readonly stmtDeletePosition: Database.Statement;
 
   constructor(path: string = dbPath()) {
     this.db = new Database(path);
@@ -82,6 +101,29 @@ export class DB {
               (SELECT COUNT(*) FROM bars b WHERE b.symbol = s.symbol) AS barCount
        FROM symbols s ORDER BY s.symbol`,
     );
+    this.stmtGetSymbol = this.db.prepare(
+      `SELECT symbol, exchange, currency FROM symbols WHERE symbol = ?`,
+    );
+
+    this.stmtUpsertPosition = this.db.prepare(
+      `INSERT INTO positions (symbol, shares, avg_cost, currency, date_added, note)
+       VALUES (@symbol, @shares, @avgCost, @currency, @dateAdded, @note)
+       ON CONFLICT(symbol) DO UPDATE SET
+         shares     = excluded.shares,
+         avg_cost   = excluded.avg_cost,
+         currency   = excluded.currency,
+         date_added = excluded.date_added,
+         note       = excluded.note`,
+    );
+    this.stmtGetPosition = this.db.prepare(
+      `SELECT symbol, shares, avg_cost AS avgCost, currency, date_added AS dateAdded, note
+       FROM positions WHERE symbol = ?`,
+    );
+    this.stmtListPositions = this.db.prepare(
+      `SELECT symbol, shares, avg_cost AS avgCost, currency, date_added AS dateAdded, note
+       FROM positions ORDER BY symbol`,
+    );
+    this.stmtDeletePosition = this.db.prepare(`DELETE FROM positions WHERE symbol = ?`);
   }
 
   private migrate(): void {
@@ -106,6 +148,15 @@ export class DB {
 
       CREATE INDEX IF NOT EXISTS idx_bars_symbol_ts
         ON bars (symbol, timestamp DESC);
+
+      CREATE TABLE IF NOT EXISTS positions (
+        symbol     TEXT PRIMARY KEY,
+        shares     REAL NOT NULL,
+        avg_cost   REAL NOT NULL,
+        currency   TEXT NOT NULL,
+        date_added TEXT NOT NULL,
+        note       TEXT
+      );
     `);
   }
 
@@ -141,6 +192,28 @@ export class DB {
 
   symbolStatuses(): SymbolStatus[] {
     return this.stmtSymbolStatuses.all() as SymbolStatus[];
+  }
+
+  /** Read a single symbol's routing metadata, or null if not tracked yet. */
+  getSymbol(symbol: string): SymbolConfig | null {
+    return (this.stmtGetSymbol.get(symbol) as SymbolConfig | undefined) ?? null;
+  }
+
+  upsertPosition(row: PositionRow): void {
+    this.stmtUpsertPosition.run(row);
+  }
+
+  getPosition(symbol: string): PositionRow | null {
+    return (this.stmtGetPosition.get(symbol) as PositionRow | undefined) ?? null;
+  }
+
+  listPositions(): PositionRow[] {
+    return this.stmtListPositions.all() as PositionRow[];
+  }
+
+  /** Delete a position; returns true if a row was actually removed. */
+  deletePosition(symbol: string): boolean {
+    return this.stmtDeletePosition.run(symbol).changes > 0;
   }
 
   close(): void {
