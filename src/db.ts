@@ -82,6 +82,20 @@ export interface AlertRow {
   sellAbove: number | null;
 }
 
+/** A cached headline-sentiment classification (Phase 6). */
+export interface HeadlineSentimentRow {
+  text: string;
+  sentiment: string;
+  summary: string;
+}
+
+/** Aggregated LLM token usage (Phase 6). */
+export interface LlmUsageTotals {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export function dbPath(): string {
   return process.env.STOCKAGENT_DB ?? 'stockagent.db';
 }
@@ -122,6 +136,12 @@ export class DB {
   private readonly stmtGetAlert: Database.Statement;
   private readonly stmtListAlerts: Database.Statement;
   private readonly stmtDeleteAlert: Database.Statement;
+  private readonly stmtGetNarration: Database.Statement;
+  private readonly stmtPutNarration: Database.Statement;
+  private readonly stmtGetHeadlineSentiment: Database.Statement;
+  private readonly stmtPutHeadlineSentiment: Database.Statement;
+  private readonly stmtInsertLlmUsage: Database.Statement;
+  private readonly stmtSumLlmUsage: Database.Statement;
 
   constructor(path: string = dbPath()) {
     this.db = new Database(path);
@@ -262,6 +282,39 @@ export class DB {
       `SELECT symbol, buy_below AS buyBelow, sell_above AS sellAbove FROM alerts ORDER BY symbol`,
     );
     this.stmtDeleteAlert = this.db.prepare(`DELETE FROM alerts WHERE symbol = ?`);
+
+    this.stmtGetNarration = this.db.prepare(
+      `SELECT narration FROM narration_cache WHERE symbol = ? AND signal_hash = ?`,
+    );
+    this.stmtPutNarration = this.db.prepare(
+      `INSERT INTO narration_cache (symbol, signal_hash, narration, created_at)
+       VALUES (@symbol, @signalHash, @narration, @createdAt)
+       ON CONFLICT(symbol, signal_hash) DO UPDATE SET
+         narration  = excluded.narration,
+         created_at = excluded.created_at`,
+    );
+    this.stmtGetHeadlineSentiment = this.db.prepare(
+      `SELECT text, sentiment, summary FROM headline_sentiment WHERE headline_hash = ?`,
+    );
+    this.stmtPutHeadlineSentiment = this.db.prepare(
+      `INSERT INTO headline_sentiment (headline_hash, text, sentiment, summary, created_at)
+       VALUES (@hash, @text, @sentiment, @summary, @createdAt)
+       ON CONFLICT(headline_hash) DO UPDATE SET
+         text       = excluded.text,
+         sentiment  = excluded.sentiment,
+         summary    = excluded.summary,
+         created_at = excluded.created_at`,
+    );
+    this.stmtInsertLlmUsage = this.db.prepare(
+      `INSERT INTO llm_usage (ts, kind, model, input_tokens, output_tokens)
+       VALUES (@ts, @kind, @model, @inputTokens, @outputTokens)`,
+    );
+    this.stmtSumLlmUsage = this.db.prepare(
+      `SELECT COUNT(*) AS calls,
+              COALESCE(SUM(input_tokens), 0) AS inputTokens,
+              COALESCE(SUM(output_tokens), 0) AS outputTokens
+       FROM llm_usage`,
+    );
   }
 
   private migrate(): void {
@@ -328,6 +381,36 @@ export class DB {
         symbol     TEXT PRIMARY KEY,
         buy_below  REAL,               -- fire when latest close <= this (native ccy)
         sell_above REAL                -- fire when latest close >= this (native ccy)
+      );
+
+      -- Phase 6: cache one narration per (symbol, signal-set hash) so an
+      -- unchanged situation reuses the cached read instead of calling the LLM.
+      CREATE TABLE IF NOT EXISTS narration_cache (
+        symbol      TEXT NOT NULL,
+        signal_hash TEXT NOT NULL,     -- hash of the current signal/headline set
+        narration   TEXT NOT NULL,     -- JSON-encoded Narration
+        created_at  TEXT NOT NULL,     -- ISO
+        PRIMARY KEY (symbol, signal_hash)
+      );
+
+      -- Phase 6: cache headline sentiment per headline so the same headline is
+      -- never re-classified. Keyed by a hash of the headline text.
+      CREATE TABLE IF NOT EXISTS headline_sentiment (
+        headline_hash TEXT PRIMARY KEY,
+        text          TEXT NOT NULL,
+        sentiment     TEXT NOT NULL,   -- positive | negative | neutral
+        summary       TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+      );
+
+      -- Phase 6: append-only token-usage log so LLM cost is observable.
+      CREATE TABLE IF NOT EXISTS llm_usage (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts            TEXT NOT NULL,   -- ISO
+        kind          TEXT NOT NULL,   -- "narration" | "headline"
+        model         TEXT NOT NULL,
+        input_tokens  INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL
       );
     `);
 
@@ -492,6 +575,41 @@ export class DB {
   /** Delete an alert; returns true if a row was actually removed. */
   deleteAlert(symbol: string): boolean {
     return this.stmtDeleteAlert.run(symbol).changes > 0;
+  }
+
+  /** Cached narration JSON for a (symbol, signal-set hash), or null. */
+  getNarration(symbol: string, signalHash: string): string | null {
+    const row = this.stmtGetNarration.get(symbol, signalHash) as { narration: string } | undefined;
+    return row?.narration ?? null;
+  }
+
+  /** Upsert a cached narration for a (symbol, signal-set hash). */
+  putNarration(symbol: string, signalHash: string, narration: string, createdAt: string): void {
+    this.stmtPutNarration.run({ symbol, signalHash, narration, createdAt });
+  }
+
+  /** Cached sentiment for a headline hash, or null. */
+  getHeadlineSentiment(hash: string): HeadlineSentimentRow | null {
+    return (this.stmtGetHeadlineSentiment.get(hash) as HeadlineSentimentRow | undefined) ?? null;
+  }
+
+  /** Upsert a cached headline sentiment. */
+  putHeadlineSentiment(
+    hash: string,
+    row: { text: string; sentiment: string; summary: string },
+    createdAt: string,
+  ): void {
+    this.stmtPutHeadlineSentiment.run({ hash, ...row, createdAt });
+  }
+
+  /** Record one LLM call's token usage (append-only). */
+  logLlmUsage(row: { ts: string; kind: string; model: string; inputTokens: number; outputTokens: number }): void {
+    this.stmtInsertLlmUsage.run(row);
+  }
+
+  /** Aggregate token usage across all recorded LLM calls. */
+  llmUsageTotals(): LlmUsageTotals {
+    return this.stmtSumLlmUsage.get() as LlmUsageTotals;
   }
 
   close(): void {

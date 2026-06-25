@@ -118,18 +118,58 @@ const NotificationsConfigSchema = z
   })
   .default({});
 
+/**
+ * Phase 6 LLM-narration layer. The LLM *explains and prioritizes* what the
+ * deterministic engine already found — it never generates signals, predicts, or
+ * decides. These knobs govern only that enhancement layer; with it fully off
+ * (`enabled: false` or no API key) the tool runs entirely on the deterministic
+ * engine. The provider/model are config, not hardcoded, so a backend swap is a
+ * settings change. Secrets (the API key) live in `.env`, never here.
+ */
+const LlmConfigSchema = z
+  .object({
+    // Master switch for the narration layer. Default on, but it degrades
+    // gracefully: with no API key for the chosen provider it behaves as if
+    // disabled (deterministic summaries + an "AI explanation unavailable" note).
+    enabled: z.boolean().default(true),
+    // Which backend to call. Only `openai` is implemented today; the
+    // `LlmProvider` interface keeps the rest of the layer backend-agnostic.
+    provider: z.enum(['openai']).default('openai'),
+    // Model id, passed through to the provider. Documented default below.
+    model: z.string().min(1).default('gpt-4o'),
+    // Sampling temperature — kept low so narration stays stable/cacheable.
+    temperature: z.number().min(0).max(2).default(0.2),
+    // Default number of top-ranked symbols `explain` narrates with no symbol arg.
+    topN: z.number().int().positive().default(3),
+    // Per-symbol headline sentiment (headline text only, never article bodies).
+    headlines: z
+      .object({
+        enabled: z.boolean().default(true),
+        max: z.number().int().positive().max(20).default(5),
+      })
+      .default({}),
+  })
+  .default({});
+
 const WatchlistSchema = z.object({
   symbols: z.array(SymbolConfigSchema).min(1, 'watchlist must contain at least one symbol'),
   preferences: PreferencesSchema,
   signals: SignalsConfigSchema,
   notifications: NotificationsConfigSchema,
+  llm: LlmConfigSchema,
 });
 
 export type SymbolConfig = z.infer<typeof SymbolConfigSchema>;
 export type Preferences = z.infer<typeof PreferencesSchema>;
 export type SignalsConfig = z.infer<typeof SignalsConfigSchema>;
 export type NotificationsConfig = z.infer<typeof NotificationsConfigSchema>;
+export type LlmConfig = z.infer<typeof LlmConfigSchema>;
 export type Watchlist = z.infer<typeof WatchlistSchema>;
+
+/** The fully-defaulted LLM config (handy for tests and tooling). */
+export function defaultLlmConfig(): LlmConfig {
+  return LlmConfigSchema.parse(undefined);
+}
 
 /** The fully-defaulted notifications config (handy for tests and tooling). */
 export function defaultNotificationsConfig(): NotificationsConfig {

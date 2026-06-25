@@ -1,4 +1,4 @@
-# StockAgent — Phases 1–5 (data, storage, portfolio, FX, signals, notifications & dashboard)
+# StockAgent — Phases 1–6 (data, storage, portfolio, FX, signals, notifications, dashboard & LLM narration)
 
 A personal stock monitoring agent for macOS (CLI-first). Home currency is **CAD**.
 
@@ -22,14 +22,25 @@ A personal stock monitoring agent for macOS (CLI-first). Home currency is **CAD*
   for `actionable` signals only — fire-once, throttled, quiet-hours-aware, and
   suppressed on startup so it never spams — plus a live-updating **CLI
   dashboard**. See [Notifications](#notifications) and [Dashboard](#dashboard).
+- **Phase 6** adds the **LLM narration layer** (the `explain` command): for the
+  top-ranked symbols it produces a plain-language **read**, an explicit **bull
+  AND bear** interpretation of the same facts, and **one suggested action framed
+  as a single option** whose percentage is **computed in code, not by the model**.
+  It also **ranks** which symbols deserve attention (where `preferences.cadBias`
+  is finally consumed) and classifies **news-headline sentiment**. The LLM
+  *explains and prioritizes what the deterministic layer already found* — it never
+  generates signals, never predicts, and never decides. See
+  [LLM narration](#llm-narration-explain).
 
 **Signals describe what is currently true — never a prediction.** There is no
 forecast, no price target, no "expected move" anywhere in the engine; the
 multi-timeframe module reports *where price sits within past windows* as factual
 context only. Every notification body and dashboard cell carries the same
 framing — **"signal, not advice"**, "as of last cached close" — so nothing
-implies real-time data or a recommendation. Still **no LLM narration or ranking**
-(Phase 6). "Current price" everywhere means the **latest cached close**, not a
+implies real-time data or a recommendation. The Phase-6 LLM layer preserves this
+contract and enforces it **in code, not just the prompt**: it cannot predict,
+must always give both sides, and any number it states is the code-computed value
+echoed back. "Current price" everywhere means the **latest cached close**, not a
 live tick.
 
 ## Requirements
@@ -52,6 +63,11 @@ US symbols use **Alpaca** when `ALPACA_KEY` / `ALPACA_SECRET` are set in `.env`
 `yahoo-finance2`**, so the app runs fully without an Alpaca account. TSX (`.TO`)
 symbols always use `yahoo-finance2`. Secrets live in `.env` (git-ignored) and are
 never committed.
+
+**`OPENAI_API_KEY`** powers the optional Phase-6 LLM narration (`explain`). If
+it's absent, `explain` runs on the deterministic engine and prints deterministic
+summaries with an "AI explanation unavailable" note — so the tool is fully
+functional without an OpenAI account. See [LLM narration](#llm-narration-explain).
 
 ## Watchlist
 
@@ -83,9 +99,10 @@ symbols:
     currency: USD
 ```
 
-`cadBias` is **parsed and validated only** in this phase — it's a stub the later
-signal layer will read to tilt ranking toward/away from CAD exposure. Nothing
-acts on it yet. An out-of-range value fails loudly on load.
+`cadBias` tilts the Phase-6 attention **ranking** toward (positive) or away from
+(negative) CAD-denominated symbols; `0` is neutral. It's a bounded *nudge*, not
+an override — see [LLM narration → ranking](#ranking-where-cadbias-is-consumed)
+for the exact formula. An out-of-range value fails loudly on load.
 
 ## Usage
 
@@ -375,6 +392,152 @@ periodic line output — no ANSI redraws, no garbage. And a render fault is caug
 and logged: **the monitoring engine is primary; the view is disposable** and can
 never take down the loop.
 
+## LLM narration (`explain`)
+
+Phase 6 is the **narration layer**. It takes the deterministic signals,
+multi-timeframe context, and your actual position numbers, and produces — per
+relevant symbol — a plain-language **read**, an explicit **bull and bear**
+interpretation of the same facts, and **one suggested action framed as a single
+option**. It also **ranks** which symbols deserve attention and classifies
+**news-headline sentiment**.
+
+```bash
+# Narrate the top-ranked symbols (default count from llm.topN)
+node dist/index.js explain
+
+# Narrate the top 5
+node dist/index.js explain --top 5
+
+# Narrate one named symbol
+node dist/index.js explain AAPL
+
+# Run fully on the deterministic layer — no API calls
+node dist/index.js explain AAPL --no-llm
+```
+
+Each symbol prints: **Read** (factual present-tense situation), **Bull** and
+**Bear** (two readings of the *same* facts), one **Option** (with the
+code-computed basis % shown), the cached **headline** sentiments, and the closing
+line **"Your call — mechanical signal, not advice."**
+
+### The framing contract (enforced in code, not just the prompt)
+
+The whole point of the deterministic layers is that the LLM has nothing
+prediction-shaped to grab. That contract is enforced **twice** — in the prompt
+*and* by a code-side validator on every response, because models drift and a
+confident false forecast about your money is the exact failure this architecture
+exists to prevent:
+
+1. **No prediction, ever.** A forbidden-language filter (regex for
+   `predict`/`forecast`/`will rise|fall`/`expect`/`target price`/`guarantee`/…)
+   runs over the `read`/`bull`/`bear`/`option` fields. If a field trips it, that
+   field is **discarded and replaced** with the deterministic summary, and the
+   event is logged — the model is never trusted to self-police.
+2. **Always both sides.** `bull` and `bear` are mandatory fields, so a single
+   directional verdict is structurally impossible.
+3. **Suggested action = one option, and the % is code-decided.** The trim
+   percentage is computed in code (see below) and passed *into* the prompt; the
+   model only phrases it. The returned `basisPct` **must equal** the code value —
+   if the model invents or alters it, the validator repairs it back. A number that
+   originates in the model is a bug, not a feature.
+4. **Always ends with "your call — mechanical signal, not advice."**
+5. The model is given **only** the structured signal/context/position numbers —
+   never raw price series — and is told it has no predictive ability.
+
+If the LLM call fails, times out, rate-limits, or returns malformed JSON (after
+one repair retry), `explain` falls back to the **deterministic signal summaries**
+for that symbol with an "AI explanation unavailable" note. **The deterministic
+engine is the product; the LLM is an enhancement** — and `start`'s poll / signal
+/ notify loops never call it, so an LLM outage can't touch monitoring.
+
+### How the suggested trim % is decided (code, not the model)
+
+For a held position the suggested-trim % comes from deterministic
+position-sizing, documented and auditable:
+
+- **Concentration term.** If the position is overweight (CAD share above the
+  `signals.concentration.overweightPct` line), the base trim is the fraction that
+  brings its weight back *to* the line: `(sharePct − line) / sharePct × 100`.
+- **Gain term.** A larger unrealized gain adds a small, capped increment:
+  `min(15, gainPct / 4)`. Losses add nothing.
+- The two sum, then clamp to **[5, 50]%** and round to the nearest 5%. With no
+  reduce-exposure rationale (not overweight, not a large gain) the result is
+  `null` and no numeric action is offered.
+
+### Ranking (where `cadBias` is consumed)
+
+Code ranks; the LLM only narrates the top-ranked items. A symbol's **base score**
+rewards attention-worthiness:
+
+- actionable signals dominate (weight 100 each),
+- notable signals matter (10 each),
+- context extremes — latest close near a window high/low — add 5 each,
+- concentration adds its CAD portfolio-share directly, and unrealized-P&L
+  magnitude adds a little,
+- every symbol gets a floor of 1 so the bias can still order quiet names.
+
+Then **`preferences.cadBias ∈ [−1, 1]`** applies as a bounded nudge:
+
+```
+adjusted = base × (1 + cadBias × dir × 0.5)      dir = +1 for CAD, −1 for USD
+```
+
+At `cadBias = 0` the factor is 1 (neutral). Positive favours CAD, negative
+favours USD. Because it's a bounded multiplier on the base score, a strong
+actionable signal still outranks a quiet CAD name — the bias only breaks
+near-ties and tilts the middle of the list.
+
+### Headline sentiment
+
+For each narrated symbol, recent **headlines** are fetched (via the same
+`yahoo-finance2` provider, `headline text only` — never article bodies) and each
+is classified `positive` / `negative` / `neutral` with a one-line neutral summary.
+The sentiments feed into the narration as one more input *signal* (context, not a
+prediction). Each headline is classified **at most once ever** — results are
+cached per headline.
+
+### Cost, caching & what's sent to the API
+
+- **The LLM is not called every poll cycle.** It's on-demand (`explain`) and the
+  narration is **cached by (symbol, signal-set hash)**: re-running `explain` on a
+  symbol whose signal set, trim %, and headline sentiments are unchanged reuses
+  the cached read with **no API call**; any change to that set invalidates it.
+- **Token usage is logged** (`llm_usage` table) and `explain` prints a cumulative
+  `calls / input + output tokens` line so cost is observable.
+- **What is sent to the API:** only the structured market/position numbers the
+  deterministic engine produced (signals, context-window stats, your position's
+  shares/avg-cost/P&L/concentration and the code-computed trim %) plus **headline
+  text** for sentiment. **No credentials, no raw price series, no article
+  bodies.** Your position sizes are your own data — fine to send to your chosen
+  provider, but noted here so the choice is informed.
+
+### Disabling the layer / switching provider
+
+- **`--no-llm`** on `explain` runs a single invocation fully deterministically.
+- **`llm.enabled: false`** in `watchlist.yaml` disables it globally.
+- A missing `OPENAI_API_KEY` behaves the same as disabled (deterministic summaries
+  + an "AI explanation unavailable" note).
+- The backend is config (`llm.provider` / `llm.model`), not hardcoded, and sits
+  behind a backend-agnostic `LlmProvider` interface. **To switch provider:**
+  implement that interface in `src/llm/` and add a branch to
+  `resolveLlmProvider` — the narration, ranking, validation, and caching code is
+  provider-agnostic and stays unchanged.
+
+Settings live in an optional `llm:` block in `watchlist.yaml` (zod-validated,
+documented defaults):
+
+```yaml
+llm:
+  enabled: true            # master switch; false → deterministic only
+  provider: openai         # only `openai` implemented today
+  model: gpt-4o            # passed through to the provider
+  temperature: 0.2         # low, for stable/cacheable narration
+  topN: 3                  # default symbols `explain` narrates with no arg
+  headlines:
+    enabled: true          # per-symbol headline sentiment
+    max: 5                 # headlines per symbol
+```
+
 ## Storage
 
 Data is stored in `stockagent.db` (override with `STOCKAGENT_DB`):
@@ -399,6 +562,13 @@ Data is stored in `stockagent.db` (override with `STOCKAGENT_DB`):
   a notification was dispatched for that fire, enforcing fire-once.
 - `alerts(symbol, buy_below, sell_above)` holds user price levels (native
   currency; either bound nullable). `symbol` is the primary key.
+- `narration_cache(symbol, signal_hash, narration, created_at)` caches one LLM
+  narration per `(symbol, signal-set hash)` so an unchanged situation reuses the
+  stored read (Phase 6). `(symbol, signal_hash)` is the primary key.
+- `headline_sentiment(headline_hash, text, sentiment, summary, created_at)` caches
+  per-headline sentiment so the same headline is never re-classified.
+- `llm_usage(id, ts, kind, model, input_tokens, output_tokens)` is the append-only
+  token-usage log behind the cost readout.
 
 Timestamps are epoch-milliseconds (UTC); FX `date` is an ISO calendar day;
 signal `fired_at`/`cleared_at` are ISO timestamps.
@@ -410,6 +580,13 @@ the Phase-4 signal engine: indicators, window/percentile math, each generator
 fed synthetic series with known answers (e.g. a constructed oversold series fires
 `rsi_oversold` and nothing else), and the dedup/persistence state machine against
 a throwaway SQLite DB.
+
+The Phase-6 LLM layer is tested **without any network or API key** via a mock
+provider: input-assembly purity, the zod schema, the `basisPct`-must-match-code
+check, the forbidden-language filter (a deliberately prediction-laden mock
+response is caught and the deterministic fallback is used), position-sizing,
+cadBias ranking reorder, narration caching (an unchanged signal set makes no
+second call), and per-headline sentiment caching (headline text only).
 
 ```bash
 npm test     # node --test via tsx over src/**/*.test.ts
@@ -432,6 +609,8 @@ src/
     alpaca.ts         US bars (Alpaca IEX feed)
     yahoo.ts          TSX + key-less fallback (yahoo-finance2)
     index.ts          routes a symbol to the right provider
+    newsTypes.ts      Headline / NewsProvider interfaces
+    news.ts           recent headlines (text only) via yahoo-finance2 search
   portfolio/
     PortfolioProvider.ts      backend-agnostic portfolio interface + Position
     SqlitePortfolioProvider.ts  v1 SQLite-backed implementation
@@ -462,8 +641,22 @@ src/
     snapshot.ts       cache-only point-in-time view model (bars, positions, signals, FX)
     render.ts         cli-table3 + chalk renderer; plain non-TTY fallback
     render.test.ts    plain/color render tests (no-ANSI when piped, markers, totals)
+  llm/
+    types.ts          LlmProvider / Narration / NarrationInput shapes
+    input.ts          buildNarrationInput — pure structured-input assembly
+    positionSizing.ts deterministic suggested-trim % (code decides the number)
+    ranking.ts        attention ranking; consumes preferences.cadBias
+    schema.ts         zod schema + forbidden-language filter + deterministic fallback
+    prompt.ts         system prompt (framing contract + few-shot) + user content
+    hash.ts           signal-set / headline hashes for the caches
+    OpenAiProvider.ts OpenAI implementation (structured outputs, repair retry)
+    provider.ts       resolveLlmProvider — config/key-driven backend selection
+    headlines.ts      headline fetch + sentiment classification + per-headline cache
+    narrator.ts       orchestration: cache → LLM → validate → cache, with fallback
+    assemble.ts       runs the engine + attaches CAD position numbers per symbol
+    *.test.ts         input purity, schema/forbidden/basisPct, ranking, caching tests
   commands/
-    start.ts  dashboard.ts  bars.ts  status.ts  portfolio.ts  fx.ts  scan.ts  signals.ts  alert.ts
+    start.ts  dashboard.ts  bars.ts  status.ts  portfolio.ts  fx.ts  scan.ts  signals.ts  alert.ts  explain.ts
   scripts/
     smokeAlpaca.ts    one-off live Alpaca bars smoke test
 ```

@@ -10,6 +10,7 @@ import { registerFx } from './commands/fx.js';
 import { registerScan } from './commands/scan.js';
 import { registerSignals } from './commands/signals.js';
 import { registerAlert } from './commands/alert.js';
+import { registerExplain } from './commands/explain.js';
 import { errMsg } from './util.js';
 
 const program = new Command();
@@ -28,6 +29,7 @@ registerFx(program);
 registerScan(program);
 registerSignals(program);
 registerAlert(program);
+registerExplain(program);
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(`stockagent: ${errMsg(err)}`);
