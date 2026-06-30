@@ -160,6 +160,15 @@ node dist/index.js edit AAPL --shares 12
 node dist/index.js edit AAPL --cost 175 --note "added on dip"
 node dist/index.js edit BABA --fx-at-cost 1.35        # fix/backfill the purchase rate
 
+# Record a buy: opens a new position, or blends into an existing one (recomputes
+# the weighted-average cost + a cost-weighted FX rate for you).
+node dist/index.js buy BABA 5 --price 110                  # blend at today's FX rate
+node dist/index.js buy BABA 5 --price 110 --fx-at-cost 1.40  # pin this buy's rate
+node dist/index.js buy MSFT 3 --price 400 --usd           # opens MSFT (like add)
+
+# Record a sell: reduces shares at the same average cost; selling all closes it.
+node dist/index.js sell BABA 4
+
 # List all positions (symbol, shares, avg cost, currency, cost basis, …)
 node dist/index.js show
 
@@ -186,6 +195,23 @@ node dist/index.js remove SHOP.TO
   always 1 and the flag is rejected for them) and needs no network, so it also
   lets you `add` offline. On `edit`, omitting it leaves the existing snapshot
   untouched.
+- **`buy <symbol> <shares> --price <x>`** records a purchase. On an **unheld**
+  symbol it opens the position (so it subsumes `add` for a fresh buy, inferring
+  currency the same way). On a **held** symbol it *blends* the buy in: the new
+  share count and the **weighted-average cost** are recomputed, and `fx_at_cost`
+  becomes the **cost-weighted average** of the old and new rates — so a single
+  record still reflects lots bought at different prices *and* different FX rates,
+  exactly. Per-buy FX auto-snapshots the current rate; `--fx-at-cost <rate>` pins
+  this buy's rate (USD only). If the held position has no FX snapshot, the blend
+  can't be computed and the buy is recorded with the split unavailable (a warning
+  says how to fix it).
+- **`sell <symbol> <shares>`** reduces the share count at the **same average
+  cost** (standard average-cost method — selling doesn't change per-share cost
+  basis or its FX snapshot); selling your whole holding **closes** the position.
+- The model stays a **single record per symbol** — no per-lot history and no
+  realized-P&L tracking on sells. It captures your *current* blended holding
+  (shares, average cost, blended FX rate) accurately, which is what every
+  downstream view (CAD cost basis, FX Δ, signals) needs.
 
 ## FX & currency
 

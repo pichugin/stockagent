@@ -5,6 +5,7 @@ import { decomposeCostBasisFx } from '../fx/convert.js';
 import { FxService } from '../fx/FxService.js';
 import type { FxRateView } from '../fx/FxService.js';
 import { WS_SPREAD_NOTE } from '../fx/notes.js';
+import { blendBuy } from '../portfolio/blend.js';
 import type { Currency, Position } from '../portfolio/PortfolioProvider.js';
 import { SqlitePortfolioProvider } from '../portfolio/SqlitePortfolioProvider.js';
 import { inferSymbolMeta, normalizeSymbol } from '../symbols.js';
@@ -107,6 +108,18 @@ interface EditOptions {
   fxAtCost?: string;
 }
 
+interface BuyOptions {
+  price: string;
+  cad?: boolean;
+  usd?: boolean;
+  note?: string;
+  fxAtCost?: string;
+}
+
+interface SellOptions {
+  note?: string;
+}
+
 /**
  * Resolve the cost-basis FX snapshot for a position. An explicit `--fx-at-cost`
  * (the USD→CAD rate at purchase) wins and needs no network; it's rejected for
@@ -170,6 +183,152 @@ export function registerPortfolio(program: Command): void {
         const position = await portfolio.upsert({ symbol, shares, avgCost, currency, note: opts.note, fxAtCost });
         console.log(`Saved position for ${symbol}:\n`);
         printPosition(position);
+      } finally {
+        db.close();
+      }
+    });
+
+  program
+    .command('buy')
+    .argument('<symbol>', 'symbol to buy, e.g. AAPL or SHOP.TO')
+    .argument('<shares>', 'number of shares bought (fractional allowed)')
+    .description('Record a buy — opens a new position, or blends into an existing one.')
+    .requiredOption('--price <x>', 'price paid per share, in native currency')
+    .option('--cad', 'force the position currency to CAD (new positions only)')
+    .option('--usd', 'force the position currency to USD (new positions only)')
+    .option('--note <text>', 'free-text note')
+    .option(
+      '--fx-at-cost <rate>',
+      'USD→CAD rate for this buy (1 USD = <rate> CAD); overrides the auto-snapshot. USD positions only',
+    )
+    .action(async (rawSymbol: string, rawShares: string, opts: BuyOptions) => {
+      const symbol = normalizeSymbol(rawSymbol);
+      const buyShares = parse(sharesSchema, rawShares, 'invalid shares');
+      const price = parse(costSchema, opts.price, 'invalid price');
+
+      const db = new DB();
+      const portfolio = new SqlitePortfolioProvider(db);
+      try {
+        const existing = await portfolio.get(symbol);
+
+        if (!existing) {
+          // Opening lot — identical to `add`, with price as the initial avg cost.
+          const currency = resolveCurrency(db, symbol, opts);
+          const { exchange } = inferSymbolMeta(symbol);
+          db.upsertSymbol({ symbol, exchange, currency });
+          const fxAtCost = await resolveFxAtCost(db, currency, opts.fxAtCost);
+          const opened = await portfolio.upsert({
+            symbol,
+            shares: buyShares,
+            avgCost: price,
+            currency,
+            note: opts.note,
+            fxAtCost,
+          });
+          console.log(`Opened position for ${symbol}:\n`);
+          printPosition(opened);
+          return;
+        }
+
+        // Accumulating into a held position. Currency is fixed by the position;
+        // a contradicting flag is an error rather than silently ignored.
+        if ((opts.cad && existing.currency !== 'CAD') || (opts.usd && existing.currency !== 'USD')) {
+          throw new Error(
+            `${symbol} is held in ${existing.currency}; --cad/--usd cannot change an existing position's currency`,
+          );
+        }
+
+        const buyFx = await resolveFxAtCost(db, existing.currency, opts.fxAtCost);
+        const blended = blendBuy(
+          existing.shares,
+          existing.avgCost,
+          existing.fxAtCost ?? null,
+          buyShares,
+          price,
+          buyFx,
+          existing.currency,
+        );
+
+        if (existing.currency === 'USD' && blended.fxAtCost == null) {
+          log.warn(
+            `${symbol} has no FX-at-cost snapshot, so the blended rate can't be computed — ` +
+              'set it with `edit --fx-at-cost <rate>` (or re-baseline by passing --fx-at-cost here). ' +
+              'Recording the buy with FX split unavailable.',
+          );
+        }
+
+        const updated = await portfolio.upsert({
+          symbol,
+          shares: blended.shares,
+          avgCost: blended.avgCost,
+          currency: existing.currency,
+          dateAdded: existing.dateAdded,
+          note: opts.note ?? existing.note,
+          fxAtCost: blended.fxAtCost,
+        });
+        console.log(
+          `Bought ${buyShares} ${symbol} @ ${price.toFixed(2)} ${existing.currency} — ` +
+            `${existing.shares} → ${updated.shares} shares, ` +
+            `avg cost ${existing.avgCost.toFixed(2)} → ${updated.avgCost.toFixed(2)}` +
+            (existing.currency === 'USD'
+              ? `, FX@cost ${existing.fxAtCost?.toFixed(4) ?? 'n/a'} → ${updated.fxAtCost?.toFixed(4) ?? 'n/a'}`
+              : '') +
+            '\n',
+        );
+        printPosition(updated);
+      } finally {
+        db.close();
+      }
+    });
+
+  program
+    .command('sell')
+    .argument('<symbol>', 'symbol to sell (must already be held)')
+    .argument('<shares>', 'number of shares sold (fractional allowed)')
+    .description(
+      'Record a sell — reduces shares at the same average cost (no realized P&L tracked).',
+    )
+    .option('--note <text>', 'new note')
+    .action(async (rawSymbol: string, rawShares: string, opts: SellOptions) => {
+      const symbol = normalizeSymbol(rawSymbol);
+      const sellShares = parse(sharesSchema, rawShares, 'invalid shares');
+
+      const db = new DB();
+      const portfolio = new SqlitePortfolioProvider(db);
+      try {
+        const existing = await portfolio.get(symbol);
+        if (!existing) {
+          throw new Error(`${symbol} is not held — nothing to sell.`);
+        }
+        if (sellShares > existing.shares) {
+          throw new Error(
+            `cannot sell ${sellShares} ${symbol} — only ${existing.shares} held`,
+          );
+        }
+
+        const remaining = existing.shares - sellShares;
+        if (remaining === 0) {
+          await portfolio.remove(symbol);
+          console.log(`Sold all ${sellShares} ${symbol} — position closed.`);
+          return;
+        }
+
+        // Average-cost method: selling part of a holding leaves the per-share
+        // cost basis (and its FX snapshot) unchanged.
+        const updated = await portfolio.upsert({
+          symbol,
+          shares: remaining,
+          avgCost: existing.avgCost,
+          currency: existing.currency,
+          dateAdded: existing.dateAdded,
+          note: opts.note ?? existing.note,
+          fxAtCost: existing.fxAtCost,
+        });
+        console.log(
+          `Sold ${sellShares} ${symbol} — ${existing.shares} → ${updated.shares} shares ` +
+            `(avg cost ${updated.avgCost.toFixed(2)} ${updated.currency} unchanged):\n`,
+        );
+        printPosition(updated);
       } finally {
         db.close();
       }
