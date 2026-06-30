@@ -17,6 +17,9 @@ const sharesSchema = z.coerce
 const costSchema = z.coerce
   .number({ invalid_type_error: 'cost must be a number' })
   .nonnegative('cost must be 0 or greater');
+const fxRateSchema = z.coerce
+  .number({ invalid_type_error: 'FX rate must be a number' })
+  .positive('FX rate must be greater than 0');
 
 /** Parse with a schema, throwing a flat, user-facing message on failure. */
 function parse<T>(schema: z.ZodType<T>, value: unknown, label: string): T {
@@ -94,12 +97,34 @@ interface AddOptions {
   cad?: boolean;
   usd?: boolean;
   note?: string;
+  fxAtCost?: string;
 }
 
 interface EditOptions {
   shares?: string;
   cost?: string;
   note?: string;
+  fxAtCost?: string;
+}
+
+/**
+ * Resolve the cost-basis FX snapshot for a position. An explicit `--fx-at-cost`
+ * (the USD→CAD rate at purchase) wins and needs no network; it's rejected for
+ * CAD positions, which have no FX exposure. With no flag, USD positions fall
+ * back to the auto-snapshot of the current rate.
+ */
+async function resolveFxAtCost(
+  db: DB,
+  currency: Currency,
+  rawFxAtCost: string | undefined,
+): Promise<number | null> {
+  if (rawFxAtCost !== undefined) {
+    if (currency === 'CAD') {
+      throw new Error('CAD positions have no FX exposure (rate is always 1) — drop --fx-at-cost');
+    }
+    return parse(fxRateSchema, rawFxAtCost, 'invalid FX rate');
+  }
+  return snapshotFxAtCost(db, currency);
 }
 
 export function registerPortfolio(program: Command): void {
@@ -112,6 +137,10 @@ export function registerPortfolio(program: Command): void {
     .option('--cad', 'force the position currency to CAD')
     .option('--usd', 'force the position currency to USD')
     .option('--note <text>', 'free-text note')
+    .option(
+      '--fx-at-cost <rate>',
+      'USD→CAD rate at purchase (1 USD = <rate> CAD); overrides the auto-snapshot. USD positions only',
+    )
     .action(async (rawSymbol: string, rawShares: string, opts: AddOptions) => {
       const symbol = normalizeSymbol(rawSymbol);
       const shares = parse(sharesSchema, rawShares, 'invalid shares');
@@ -131,11 +160,12 @@ export function registerPortfolio(program: Command): void {
         const { exchange } = inferSymbolMeta(symbol);
         db.upsertSymbol({ symbol, exchange, currency });
 
-        // Snapshot the USD→CAD rate at cost basis so the FX split is exact later.
-        // CAD positions have no FX exposure (snapshot 1). For USD positions we
-        // need a live/cached rate; if none is available, store null and note the
-        // split will be unavailable rather than guess.
-        const fxAtCost = await snapshotFxAtCost(db, currency);
+        // Lock in the USD→CAD rate at cost basis so the FX split is exact later.
+        // An explicit --fx-at-cost (the rate at purchase) wins; otherwise we
+        // auto-snapshot the current rate. CAD positions have no FX exposure
+        // (snapshot 1); a USD position with no rate available stores null and
+        // reports its split as unavailable rather than guessing.
+        const fxAtCost = await resolveFxAtCost(db, currency, opts.fxAtCost);
 
         const position = await portfolio.upsert({ symbol, shares, avgCost, currency, note: opts.note, fxAtCost });
         console.log(`Saved position for ${symbol}:\n`);
@@ -168,6 +198,10 @@ export function registerPortfolio(program: Command): void {
     .option('--shares <n>', 'new share count')
     .option('--cost <x>', 'new average cost per share')
     .option('--note <text>', 'new note')
+    .option(
+      '--fx-at-cost <rate>',
+      'USD→CAD rate at purchase (1 USD = <rate> CAD). USD positions only',
+    )
     .action(async (rawSymbol: string, opts: EditOptions) => {
       const symbol = normalizeSymbol(rawSymbol);
       const db = new DB();
@@ -177,8 +211,15 @@ export function registerPortfolio(program: Command): void {
         if (!existing) {
           throw new Error(`${symbol} is not held — use "add" to create it first.`);
         }
-        if (opts.shares === undefined && opts.cost === undefined && opts.note === undefined) {
-          throw new Error('nothing to edit — pass at least one of --shares / --cost / --note');
+        if (
+          opts.shares === undefined &&
+          opts.cost === undefined &&
+          opts.note === undefined &&
+          opts.fxAtCost === undefined
+        ) {
+          throw new Error(
+            'nothing to edit — pass at least one of --shares / --cost / --note / --fx-at-cost',
+          );
         }
 
         const shares =
@@ -188,6 +229,12 @@ export function registerPortfolio(program: Command): void {
         const avgCost =
           opts.cost !== undefined ? parse(costSchema, opts.cost, 'invalid cost') : existing.avgCost;
         const note = opts.note !== undefined ? opts.note : existing.note;
+        // Only touch the FX snapshot when --fx-at-cost is passed; otherwise omit
+        // it so the provider preserves the existing snapshot. Rejected for CAD.
+        const fxAtCost =
+          opts.fxAtCost !== undefined
+            ? await resolveFxAtCost(db, existing.currency, opts.fxAtCost)
+            : undefined;
 
         const position = await portfolio.upsert({
           symbol,
@@ -196,6 +243,7 @@ export function registerPortfolio(program: Command): void {
           currency: existing.currency,
           dateAdded: existing.dateAdded,
           note,
+          ...(fxAtCost !== undefined ? { fxAtCost } : {}),
         });
         console.log(`Updated position for ${symbol}:\n`);
         printPosition(position);

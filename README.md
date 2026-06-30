@@ -150,9 +150,15 @@ node dist/index.js add ENB.TO 100 --cost 50            # infers CAD
 node dist/index.js add MSFT 3 --cost 400               # infers USD
 node dist/index.js add AAPL 10 --cost 180 --usd --note "long-term"
 
+# Pin the USD->CAD rate at your actual purchase date (USD positions only).
+# Without this, add auto-snapshots *today's* rate — only correct if you add the
+# position the same day you buy it.
+node dist/index.js add BABA 10 --cost 125 --usd --fx-at-cost 1.35
+
 # Partially update an existing position (only the fields you pass)
 node dist/index.js edit AAPL --shares 12
 node dist/index.js edit AAPL --cost 175 --note "added on dip"
+node dist/index.js edit BABA --fx-at-cost 1.35        # fix/backfill the purchase rate
 
 # List all positions (symbol, shares, avg cost, currency, cost basis, …)
 node dist/index.js show
@@ -173,6 +179,13 @@ node dist/index.js remove SHOP.TO
   components. If FX is entirely unavailable when adding a USD position, the
   snapshot is stored as `NULL` and that position reports its FX split as `n/a`
   rather than guessing. `edit` preserves the original snapshot.
+- **`--fx-at-cost <rate>`** (on `add` *and* `edit`) overrides that auto-snapshot
+  with the USD→CAD rate at your actual purchase date (1 USD = `<rate>` CAD) — the
+  accurate input for the FX split when you record a position after the fact, or
+  to backfill a legacy `NULL`/wrong snapshot. It's USD-only (CAD positions are
+  always 1 and the flag is rejected for them) and needs no network, so it also
+  lets you `add` offline. On `edit`, omitting it leaves the existing snapshot
+  untouched.
 
 ## FX & currency
 
