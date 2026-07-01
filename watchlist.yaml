@@ -31,9 +31,9 @@ preferences:
 #   quietHoursOutsideMarket: true  # suppress non-threshold pushes when markets closed
 
 symbols:
-  - symbol: AAPL
-    exchange: US
-    currency: USD
+  - symbol: AAPL.TO
+    exchange: TSX
+    currency: CAD
   - symbol: NVDA
     exchange: US
     currency: USD
