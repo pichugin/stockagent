@@ -5,4 +5,7 @@ dist/
 *.db-wal
 *.db-shm
 .env
+.env.*
+!.env.example
+.claude/settings.local.json
 .DS_Store
